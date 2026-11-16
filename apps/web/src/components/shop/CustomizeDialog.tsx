@@ -4,7 +4,14 @@ import { useMemo, useState } from "react";
 import { Minus, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from "@/components/ui/dialog";
 import OptionFields from "@/components/shop/OptionFields";
 import { useCart } from "@/contexts/CartContext";
 import { calcUnitPrice, formatVND, sortedSizes } from "@/lib/shop";
@@ -60,7 +67,8 @@ export default function CustomizeDialog({ product, toppings, onClose }: Props) {
     const unitPrice = calcUnitPrice(basePrice, sizeSurcharge, chosen);
     const maxStock = product.stock ?? 999999;
 
-    const toggle = (id: number) => setPickedIds((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
+    const toggle = (id: number) =>
+        setPickedIds((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
 
     const submit = () => {
         addItem({
@@ -81,39 +89,58 @@ export default function CustomizeDialog({ product, toppings, onClose }: Props) {
 
     return (
         <Dialog open onOpenChange={(o) => !o && onClose()}>
-            <DialogContent className="rounded-2xl sm:max-w-md max-h-[90vh] overflow-y-auto">
-                <DialogHeader>
-                    <DialogTitle>{product.name}</DialogTitle>
-                    <DialogDescription>{product.description || `Giá gốc ${formatVND(basePrice)}`}</DialogDescription>
+            <DialogContent className="top-auto bottom-0 left-0 right-0 translate-x-0 translate-y-0 max-w-none w-full rounded-t-3xl rounded-b-none border-x-0 border-b-0 bg-white p-0 gap-0 flex flex-col max-h-[88dvh] overflow-hidden sm:top-[50%] sm:bottom-auto sm:left-[50%] sm:right-auto sm:-translate-x-1/2 sm:-translate-y-1/2 sm:max-w-md sm:rounded-2xl sm:border">
+                {/* Thanh nắm nhận diện Bottom Sheet trên mobile */}
+                <div className="pt-2.5 pb-1 sm:hidden shrink-0">
+                    <div className="w-10 h-1.5 rounded-full bg-[#E8E2D9] mx-auto" />
+                </div>
+
+                {/* Header cố định */}
+                <DialogHeader className="px-5 pt-2 sm:pt-5 pb-3 border-b border-[#E8E2D9] text-left shrink-0">
+                    <DialogTitle className="text-lg font-bold text-[#2B2118] pr-6">
+                        {product.name}
+                    </DialogTitle>
+                    <DialogDescription className="text-xs text-[#6B5E52] line-clamp-2">
+                        {product.description || `Giá gốc ${formatVND(basePrice)}`}
+                    </DialogDescription>
                 </DialogHeader>
 
-                <OptionFields
-                    sizes={sizes}
-                    sizeId={sizeId}
-                    onSize={setSizeId}
-                    toppings={availableToppings}
-                    pickedIds={pickedIds}
-                    onToggle={toggle}
-                />
+                {/* Vùng chọn Size & Topping cuộn độc lập */}
+                <div className="flex-1 overflow-y-auto px-5 py-4">
+                    <OptionFields
+                        sizes={sizes}
+                        sizeId={sizeId}
+                        onSize={setSizeId}
+                        toppings={availableToppings}
+                        pickedIds={pickedIds}
+                        onToggle={toggle}
+                    />
+                </div>
 
-                <DialogFooter className="flex-row items-center gap-3 sm:justify-between mt-4">
-                    <div className="flex items-center border border-border rounded-xl">
+                {/* Footer cố định dưới đáy màn hình, dễ bấm bằng ngón cái */}
+                <DialogFooter className="flex-row items-center gap-3 px-5 pt-3 pb-[calc(0.875rem+env(safe-area-inset-bottom))] sm:pb-4 border-t border-[#E8E2D9] bg-white shrink-0">
+                    <div className="flex items-center border border-[#E8E2D9] bg-[#FAF7F2] rounded-xl h-11 shrink-0">
                         <Button
                             type="button"
                             variant="ghost"
                             size="icon"
-                            className="rounded-xl"
+                            className="h-11 w-10 rounded-l-xl text-[#2B2118] hover:bg-[#E8E2D9]/60"
                             aria-label="Giảm số lượng"
                             onClick={() => setQty((q) => Math.max(1, q - 1))}
                         >
                             <Minus className="w-4 h-4" />
                         </Button>
-                        <span className="w-8 text-center font-semibold" aria-live="polite">{qty}</span>
+                        <span
+                            className="w-8 text-center text-sm font-bold text-[#2B2118]"
+                            aria-live="polite"
+                        >
+                            {qty}
+                        </span>
                         <Button
                             type="button"
                             variant="ghost"
                             size="icon"
-                            className="rounded-xl"
+                            className="h-11 w-10 rounded-r-xl text-[#2B2118] hover:bg-[#E8E2D9]/60"
                             aria-label="Tăng số lượng"
                             disabled={qty >= maxStock}
                             onClick={() => setQty((q) => q + 1)}
@@ -121,7 +148,11 @@ export default function CustomizeDialog({ product, toppings, onClose }: Props) {
                             <Plus className="w-4 h-4" />
                         </Button>
                     </div>
-                    <Button onClick={submit} className="rounded-xl flex-1">
+
+                    <Button
+                        onClick={submit}
+                        className="h-11 rounded-xl flex-1 bg-[#B45F2B] hover:bg-[#9A4F22] text-white font-bold text-sm shadow-xs active:scale-[0.98] transition-transform"
+                    >
                         Thêm vào giỏ · {formatVND(unitPrice * qty)}
                     </Button>
                 </DialogFooter>

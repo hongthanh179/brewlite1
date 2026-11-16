@@ -11,22 +11,21 @@ const STEPS = [
 ];
 
 export default function OrderTimeline({ currentStatus }: { currentStatus: string }) {
-    // Chuẩn hóa trạng thái nếu backend trả về BREWING
     const normalizedStatus = currentStatus === "BREWING" ? "PREPARING" : currentStatus;
     const activeIdx = STEPS.findIndex((s) => s.key === normalizedStatus);
     const validIdx = activeIdx === -1 ? 0 : activeIdx;
 
     return (
-        <div className="w-full py-4">
-            <div className="relative flex items-center justify-between">
-                {/* 1. Đường line nền mờ (Nối từ tâm nút 1 đến tâm nút 5: 36px / 2 = 18px) */}
-                <div className="absolute left-[18px] right-[18px] top-[18px] -translate-y-1/2 h-1 bg-stone-200 dark:bg-stone-800 z-0" />
+        <div className="w-full py-2 [--node:32px] sm:[--node:36px]">
+            <div className="relative flex items-start justify-between">
+                {/* Đường line nền mờ nối qua tâm nút đầu -> nút cuối */}
+                <div className="absolute left-[calc(var(--node)/2)] right-[calc(var(--node)/2)] top-[calc(var(--node)/2)] -translate-y-1/2 h-1 rounded-full bg-[#E8E2D9] z-0" />
 
-                {/* 2. Đường line tiến trình màu Amber (Chạy phủ kín 100% khoảng cách giữa các nút) */}
+                {/* Đường line tiến trình */}
                 <div
-                    className="absolute left-[18px] top-[18px] -translate-y-1/2 h-1 bg-amber-600 dark:bg-amber-500 transition-all duration-500 z-0"
+                    className="absolute left-[calc(var(--node)/2)] top-[calc(var(--node)/2)] -translate-y-1/2 h-1 rounded-full bg-[#B45F2B] transition-all duration-500 z-0"
                     style={{
-                        width: `calc((100% - 36px) * (${validIdx} / ${STEPS.length - 1}))`,
+                        width: `calc((100% - var(--node)) * (${validIdx} / ${STEPS.length - 1}))`,
                     }}
                 />
 
@@ -38,27 +37,29 @@ export default function OrderTimeline({ currentStatus }: { currentStatus: string
                     return (
                         <div key={step.key} className="relative z-10 flex flex-col items-center">
                             <div
-                                className={`w-9 h-9 rounded-full flex items-center justify-center transition-all duration-300 ${
+                                className={`w-[var(--node)] h-[var(--node)] rounded-full flex items-center justify-center transition-all duration-300 ${
                                     isCurrent
-                                        ? "bg-amber-900 text-white shadow-lg shadow-amber-900/30 ring-4 ring-amber-100 dark:ring-amber-950 scale-110"
+                                        ? "bg-[#2B2118] text-white shadow-md shadow-[#2B2118]/25 ring-4 ring-[#FDF1E7] scale-105"
                                         : isDone
-                                            ? "bg-amber-600 text-white"
-                                            : "bg-stone-100 dark:bg-stone-800 text-stone-400 border border-stone-200 dark:border-stone-700"
+                                            ? "bg-[#B45F2B] text-white"
+                                            : "bg-[#FAF7F2] text-[#6B5E52]/60 border border-[#E8E2D9]"
                                 }`}
                             >
                                 {isDone ? (
-                                    <Check className="w-4 h-4 stroke-[2.5]" />
+                                    <Check className="w-3.5 h-3.5 sm:w-4 sm:h-4 stroke-[2.5]" />
                                 ) : (
-                                    <StepIcon className={`w-4 h-4 ${isCurrent ? "animate-bounce" : ""}`} />
+                                    <StepIcon
+                                        className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${isCurrent ? "animate-bounce" : ""}`}
+                                    />
                                 )}
                             </div>
                             <span
-                                className={`text-[11px] mt-2 font-medium text-center whitespace-nowrap transition-colors ${
+                                className={`text-[10px] sm:text-[11px] leading-tight mt-2 max-w-[58px] sm:max-w-none text-center transition-colors ${
                                     isCurrent
-                                        ? "font-bold text-amber-900 dark:text-amber-300"
+                                        ? "font-bold text-[#2B2118]"
                                         : isDone
-                                            ? "text-stone-700 dark:text-stone-300"
-                                            : "text-stone-400 dark:text-stone-500"
+                                            ? "font-medium text-[#6B5E52]"
+                                            : "font-medium text-[#6B5E52]/60"
                                 }`}
                             >
                                 {step.label}

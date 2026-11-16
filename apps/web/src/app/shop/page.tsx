@@ -122,12 +122,13 @@ export default function ShopMenuPage() {
                 <div className="relative">
                     <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#6B5E52]" />
                     <input
-                        type="search"
+                        type="text"
+                        inputMode="search"
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
                         placeholder="Bạn muốn uống gì hôm nay?"
                         aria-label="Tìm đồ uống"
-                        className="h-11 w-full rounded-full border border-[#E8E2D9] bg-white pl-10 pr-10 text-sm text-[#2B2118] placeholder:text-[#6B5E52]/60 outline-none focus:border-[#B45F2B] focus:ring-2 focus:ring-[#B45F2B]/20"
+                        className="h-11 w-full rounded-full border border-[#E8E2D9] bg-white pl-10 pr-10 text-base sm:text-sm text-[#2B2118] placeholder:text-[#6B5E52]/60 outline-none focus:border-[#B45F2B] focus:ring-2 focus:ring-[#B45F2B]/20"
                     />
                     {query && (
                         <button
