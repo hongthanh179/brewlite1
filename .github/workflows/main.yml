@@ -1,60 +1,223 @@
-name: CI Quality Gate
+name: CI/CD Production Pipeline
 
 on:
   push:
     branches: [ "main", "develop" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main", "develop" ]
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_API: ${{ github.repository }}/brewlite-api
+  IMAGE_WEB: ${{ github.repository }}/brewlite-web
+
 jobs:
+  # =========================================================
+  # BƯỚC 1: QUALITY GATE (LINT, TEST & BUILD)
+  # =========================================================
   quality-gate:
-    name: Lint, Test and Build
+    name: 1. Lint, Test and Build
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: brewlite
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d brewlite"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/brewlite?schema=public
+      JWT_SECRET: brewlite_ci_secret_key_2026
+      NEXT_PUBLIC_API_URL: http://localhost:3001/api
 
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js Runtime
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # --- 1. KIỂM ĐỊNH BACKEND (NestJS API) ---
-      - name: Install Dependencies (API)
+      - name: Install, Migrate, Seed & Test API
+        working-directory: apps/api
         run: |
-          cd apps/api
-          npm install
-
-      - name: Lint & Compile Check (API)
-        run: |
-          cd apps/api
+          npm ci
+          npx prisma generate
+          npx prisma migrate deploy
+          npx tsx prisma/seed.ts
           npm run lint --if-present
+          npm test
+          npm run test:e2e -- orders-checkout.e2e-spec.ts
+          npm run build
 
-      - name: Run Unit Tests (API)
+      - name: Install, Lint & Build Web
+        working-directory: apps/web
         run: |
-          cd apps/api
-          npm test --if-present
-
-      - name: Build Backend (API)
-        run: |
-          cd apps/api
-          npm run build --if-present
-
-      # --- 2. KIỂM ĐỊNH FRONTEND (Next.js PWA) ---
-      - name: Install Dependencies (Web)
-        run: |
-          cd apps/web
-          npm install
-
-      - name: Lint Frontend (Web)
-        run: |
-          cd apps/web
+          npm ci
           npm run lint --if-present
+          npm run build
 
-      - name: Build Frontend (Web)
+      - name: Run Playwright Mobile E2E Tests
         run: |
-          cd apps/web
-          npm run build --if-present
-        env:
-          NEXT_PUBLIC_API_URL: http://localhost:3001
+          npm --prefix tests ci
+          npx --prefix tests playwright install --with-deps chromium
+          npm --prefix apps/api run start:prod &
+          npm --prefix apps/web run start &
+          timeout 60 bash -c 'until curl -sf http://localhost:3001/api/health && curl -sf http://localhost:3000; do sleep 2; done'
+          npm --prefix tests run test:e2e
+
+  # =========================================================
+  # BƯỚC 2 & 3: BUILD DOCKER IMAGE (TAG SHA) & PUSH REGISTRY
+  # =========================================================
+  docker-build-push:
+    name: 2. Docker Image & Push Registry
+    needs: quality-gate
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set Image Tag (Commit SHA or Git Tag)
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "sha_tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "full_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & Push API Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/api
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_API }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_API }}:${{ steps.meta.outputs.full_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_API }}:latest
+
+      - name: Build & Push Web Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/web
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.PROD_API_URL }}/api
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_WEB }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_WEB }}:${{ steps.meta.outputs.full_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_WEB }}:latest
+
+  # =========================================================
+  # BƯỚC 4 & 5: DEPLOY PRODUCTION (CI SECRETS + SAFE MIGRATION)
+  # =========================================================
+  deploy-production:
+    name: 3. Deploy to Render Production
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    outputs:
+      prev_api_deploy: ${{ steps.snapshot.outputs.prev_api_deploy }}
+      prev_web_deploy: ${{ steps.snapshot.outputs.prev_web_deploy }}
+
+    steps:
+      - name: Save Previous Live Deploy IDs (for Rollback)
+        id: snapshot
+        run: |
+          PREV_API=$(curl -sf -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_API_SERVICE_ID }}/deploys?limit=1" | jq -r '.[0].deploy.id // empty')
+          PREV_WEB=$(curl -sf -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_WEB_SERVICE_ID }}/deploys?limit=1" | jq -r '.[0].deploy.id // empty')
+          echo "prev_api_deploy=$PREV_API" >> $GITHUB_OUTPUT
+          echo "prev_web_deploy=$PREV_WEB" >> $GITHUB_OUTPUT
+          echo "Saved rollback targets -> API: $PREV_API | WEB: $PREV_WEB"
+
+      - name: Trigger Render API & Web Deployments
+        run: |
+          curl -sf -X POST "${{ secrets.RENDER_API_DEPLOY_HOOK }}"
+          echo ""
+          curl -sf -X POST "${{ secrets.RENDER_WEB_DEPLOY_HOOK }}"
+          echo ""
+
+      - name: Wait for Render Deployments to Become Live
+        run: |
+          echo "Waiting 90s for Render build, safe prisma migrate deploy, and startup..."
+          sleep 90
+
+  # =========================================================
+  # BƯỚC 6 & 7: SMOKE TEST & AUTO-ROLLBACK ON FAILURE
+  # =========================================================
+  smoke-test:
+    name: 4. Smoke Test & Rollback Guard
+    needs: deploy-production
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run Production Smoke Tests (Health, Products API, Web UI)
+        id: verify
+        run: |
+          set -e
+          echo "1. Checking API Health Endpoint..."
+          for i in {1..10}; do
+            if curl -sf "${{ secrets.PROD_API_URL }}/api/health"; then
+              echo " -> API Health OK!"
+              break
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "ERROR: API Health Check failed after 10 attempts!"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          echo "2. Checking Products Endpoint..."
+          curl -sf "${{ secrets.PROD_API_URL }}/api/products?limit=2" | grep -q '"statusCode":200'
+
+          echo "3. Checking Frontend Web Availability..."
+          curl -sf -I "${{ secrets.PROD_WEB_URL }}/shop" | grep -q "200"
+
+          echo ">>> ALL PRODUCTION SMOKE TESTS PASSED! <<<"
+
+      - name: Rollback Production on Failure & Halt Pipeline
+        if: failure()
+        run: |
+          echo "CRITICAL: Smoke test failed! Initiating automatic rollback on Render..."
+          PREV_API="${{ needs.deploy-production.outputs.prev_api_deploy }}"
+          PREV_WEB="${{ needs.deploy-production.outputs.prev_web_deploy }}"
+
+          if [ -n "$PREV_API" ]; then
+            curl -sf -X POST -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"deployId\": \"$PREV_API\"}" \
+              "https://api.render.com/v1/services/${{ secrets.RENDER_API_SERVICE_ID }}/rollback" || true
+          fi
+
+          if [ -n "$PREV_WEB" ]; then
+            curl -sf -X POST -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"deployId\": \"$PREV_WEB\"}" \
+              "https://api.render.com/v1/services/${{ secrets.RENDER_WEB_SERVICE_ID }}/rollback" || true
+          fi
+
+          echo "Rollback triggered. Pipeline halted with failure status."
+          exit 1
