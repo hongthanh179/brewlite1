@@ -1,0 +1,183 @@
+@startuml sequence-checkout
+autonumber
+skinparam shadowing false
+skinparam roundcorner 4
+skinparam dpi 150
+skinparam defaultFontSize 11
+skinparam participantPadding 8
+skinparam boxPadding 6
+skinparam noteFontSize 10
+skinparam sequenceGroupFontSize 11
+
+skinparam sequence {
+  ArrowColor #1E293B
+  ActorBorderColor #1E293B
+  LifeLineBorderColor #64748B
+  LifeLineBackgroundColor #F8FAFC
+  ParticipantBorderColor #334155
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle bold
+  GroupBorderColor #94A3B8
+  GroupBackgroundColor #F8FAFC
+}
+
+actor "Khách hàng" as User
+
+box "Client (PWA)" #F1F5F9
+  participant "Next.js App" as Client
+end box
+
+box "Backend API (NestJS)" #F8FAFC
+  participant "Order API\n& Guard" as OrderCtrl
+  participant "Payment API\n& Guard" as PayCtrl
+  participant "OrderService" as OrderSvc
+  participant "PaymentService" as PaySvc
+end box
+
+box "Storage" #F1F5F9
+  database "PostgreSQL\n(Prisma)" as DB
+end box
+
+participant "Next.js Server –\nMock Payment\n(Route Handler)" as Gateway
+
+== Giai đoạn 1: Đặt đơn & Khóa lạc quan (UC-05) ==
+
+User -> Client: Bấm "Đặt đơn" (+ Coupon)
+activate Client
+Client -> OrderCtrl: POST /api/orders [Bearer JWT]
+activate OrderCtrl
+OrderCtrl -> OrderCtrl: Guard verify JWT & ValidationPipe (DTO)
+
+alt JWT không hợp lệ hoặc DTO sai định dạng
+  OrderCtrl --> Client: HTTP 401 Unauthorized / 400 Bad Request
+  deactivate OrderCtrl
+  Client --> User: Thông báo lỗi xác thực / dữ liệu đầu vào
+  deactivate Client
+else Xác thực & Validate hợp lệ
+  OrderCtrl -> OrderSvc: createOrder(userId, dto)
+  activate OrderSvc
+
+  OrderSvc -> DB: BEGIN TRANSACTION
+  activate DB
+  OrderSvc -> DB: Kiểm tra giá niêm yết & Coupon hợp lệ
+  DB --> OrderSvc: Thông tin hợp lệ
+
+  note over OrderSvc, DB
+    <b>Khóa lạc quan (Optimistic Locking):</b>
+    UPDATE "Product" SET stock = stock - qty, version = version + 1
+    WHERE id = pid AND version = curVer AND stock >= qty
+  end note
+
+  OrderSvc -> DB: Thực thi trừ kho có điều kiện version
+
+  alt Xung đột tồn kho (Affected Rows == 0)
+    DB --> OrderSvc: 0 rows updated
+    OrderSvc -> DB: ROLLBACK TRANSACTION
+    DB --> OrderSvc: Rolled back
+    deactivate DB
+    OrderSvc --> OrderCtrl: ConflictException (409)
+    deactivate OrderSvc
+    OrderCtrl --> Client: HTTP 409 Conflict
+    deactivate OrderCtrl
+    Client --> User: Báo "Món vừa hết hàng hoặc có người mua trước"
+    deactivate Client
+  else Cập nhật kho thành công (Affected Rows == 1)
+    DB --> OrderSvc: 1 row updated
+    OrderSvc -> DB: INSERT Order ('PENDING') & OrderItems
+    DB --> OrderSvc: Order #101 created
+    OrderSvc -> DB: COMMIT TRANSACTION
+    DB --> OrderSvc: Committed
+    deactivate DB
+    OrderSvc --> OrderCtrl: OrderResponseDto (id: 101, status: PENDING)
+    deactivate OrderSvc
+    OrderCtrl --> Client: HTTP 201 Created (id: 101, finalAmount)
+    deactivate OrderCtrl
+    Client -> Client: Khởi tạo & lưu UUIDv4 (Idempotency-Key) cho lần thanh toán
+    Client --> User: Chuyển màn hình chọn thanh toán
+    deactivate Client
+  end
+end
+
+== Giai đoạn 2: Thanh toán an toàn lũy biến (UC-07) ==
+
+User -> Client: Chọn Ví/Thẻ & bấm "Thanh toán"
+activate Client
+Client -> Client: Dùng lại Idempotency-Key hiện tại (chỉ khi bấm đúp / gửi lặp do mạng chậm)
+Client -> PayCtrl: POST /api/payments [Bearer JWT]\nHeader: Idempotency-Key
+activate PayCtrl
+PayCtrl -> PayCtrl: Guard verify JWT & ValidationPipe (DTO)
+PayCtrl -> PaySvc: processPayment(userId, orderId, key)
+activate PaySvc
+
+PaySvc -> DB: Kiểm tra Idempotency-Key trong bảng Payment
+activate DB
+DB --> PaySvc: Kết quả kiểm tra
+deactivate DB
+
+alt Khóa đã tồn tại (Bấm đúp / Gửi lặp do mạng chậm)
+  PaySvc --> PayCtrl: Trả về kết quả giao dịch ban đầu
+  PayCtrl --> Client: HTTP 200 OK (Cached Result)
+  Client --> User: Giữ nguyên trạng thái (chặn trừ tiền lần 2)
+else Khóa mới: Kiểm tra điều kiện đơn hàng
+  PaySvc -> DB: Truy vấn Order(orderId)
+  activate DB
+  DB --> PaySvc: Thông tin Order (userId, status, finalAmount)
+  deactivate DB
+
+  alt Đơn không thuộc user hoặc trạng thái != PENDING / PAYMENT_FAILED
+    PaySvc --> PayCtrl: ForbiddenException (403) / BadRequestException (400)
+    PayCtrl --> Client: HTTP 403 / 400
+    Client --> User: Báo lỗi đơn hàng không hợp lệ để thanh toán
+  else Đơn hợp lệ: Thực thi giao dịch
+    PaySvc -> Gateway: POST /api/mock-pay {amount, method}
+    activate Gateway
+
+    alt Cổng thanh toán từ chối (Hết số dư / Timeout)
+      Gateway --> PaySvc: {success: false, error}
+      deactivate Gateway
+      PaySvc -> DB: BEGIN -> Order = PAYMENT_FAILED, lưu Payment FAILED (kèm key) -> COMMIT
+      activate DB
+      DB --> PaySvc: Committed (giữ kho tạm cho Retry; hoàn kho khi Hủy/Quá hạn)
+      deactivate DB
+      PaySvc --> PayCtrl: PaymentFailedException (402)
+      PayCtrl --> Client: HTTP 402 Payment Required
+      Client --> User: Báo lỗi & hiển thị nút "Thử lại thanh toán" (UC-08)
+
+      opt Người dùng chọn thử lại thanh toán (UC-08)
+        User -> Client: Bấm "Thử lại thanh toán"
+        Client -> Client: Sinh UUIDv4 mới (New Idempotency-Key) để tránh trùng key FAILED cũ
+        note right of Client
+          Gửi lại POST /api/payments với
+          Idempotency-Key mới (lặp lại Giai đoạn 2)
+        end note
+      end
+    else Giao dịch thành công (Happy Path)
+      Gateway --> PaySvc: {success: true, transactionId}
+      deactivate Gateway
+
+      note over PaySvc, DB
+        <b>ACID Transaction duy nhất:</b>
+        1. Tạo Payment (SUCCESS)
+        2. Chuyển Order -> PAID
+        3. Lưu loyaltyPointsEarned trên Order (+1 điểm / 10k)
+        4. Tăng loyaltyPoints trên User
+      end note
+
+      PaySvc -> DB: BEGIN -> Ghi Payment, Order PAID, cộng điểm User -> COMMIT
+      activate DB
+      DB --> PaySvc: Transaction committed
+      deactivate DB
+
+      PaySvc --> PayCtrl: Success (status: PAID, txnId)
+      PayCtrl --> Client: HTTP 200 OK (status: PAID)
+      Client -> Client: Dọn sạch giỏ hàng (LocalStorage)
+      Client --> User: Báo đặt hàng thành công & hiển thị điểm tích lũy
+    end
+  end
+end
+
+deactivate PaySvc
+deactivate PayCtrl
+deactivate Client
+
+@enduml

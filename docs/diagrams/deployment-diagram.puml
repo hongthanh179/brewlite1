@@ -1,0 +1,93 @@
+@startuml deployment-diagram
+skinparam shadowing false
+skinparam roundcorner 6
+skinparam dpi 150
+skinparam defaultFontName Arial
+skinparam defaultFontSize 11
+skinparam packageFontSize 12
+skinparam nodesep 45
+skinparam ranksep 45
+
+skinparam package {
+  BorderColor #64748B
+  BackgroundColor #F8FAFC
+  FontStyle bold
+}
+skinparam node {
+  BorderColor #1E293B
+  BackgroundColor #FFFFFF
+}
+skinparam artifact {
+  BorderColor #0284C7
+  BackgroundColor #E0F2FE
+}
+skinparam database {
+  BorderColor #7C3AED
+  BackgroundColor #EDE9FE
+}
+
+title UML Deployment Diagram – Kiến trúc Triển khai BrewLite (Task 3.2)
+
+' ================= TẦNG TRÊN: CLIENT | LOCAL DEV | CI/CD =================
+package "1. Ranh giới Người dùng" as ClientZone {
+  node "<<device>>\nSmartphone / Desktop" as Device {
+    artifact "Trình duyệt / PWA Client\n[Next.js UI, LocalStorage]" as PWA
+  }
+}
+
+package "2. Ranh giới Local Dev" as LocalZone {
+  node "<<Developer Host>>\nDocker Desktop" as LocalHost {
+    artifact "docker-compose.yml\n[.env.example / .env]" as Compose
+  }
+}
+
+package "3. Ranh giới CI/CD (GitHub)" as CICDZone {
+  node "<<CI Runner>>\nGitHub Actions" as GHA {
+    artifact "cicd.yml [.github/workflows]\nLint -> Test -> Build -> Deploy -> Smoke Test\n[CI Secrets: REGISTRY_TOKEN, DEPLOY_HOOKS]" as Pipeline
+  }
+  node "<<Container Registry>>\nGHCR (GitHub Container Registry)" as Registry {
+    artifact "Docker Images\n[brewlite-web, brewlite-api]" as Images
+  }
+}
+
+' ================= TẦNG DƯỚI: PRODUCTION (RENDER) =================
+package "4. Ranh giới Production (Render)" as ProdZone #F0FDF4 {
+
+  node "<<CDN / Managed TLS>>\nRender Edge [HTTPS :443]" as RenderEdge #DCFCE7
+
+  package "Render Private Network" as PrivateNet #FFFFFF {
+
+    node "<<Web Service>>\nbrewlite-web [:3000]" as WebNode {
+      artifact "Next.js App Router [apps/web]\n• SSR UI & Mock Pay (/api/mock-pay)\n• Env: NEXT_PUBLIC_API_URL" as NextApp
+    }
+
+    node "<<Web Service>>\nbrewlite-api [:3001]" as ApiNode {
+      artifact "NestJS REST API [apps/api]\n• Prisma Migrate & GET /health\n• Secrets: DATABASE_URL, JWT_SECRET" as NestApp
+    }
+
+    node "<<Render Managed Database>>\nPostgreSQL 16" as DbNode {
+      database "brewlite-db\n[apps/api/prisma]" as Postgres
+      storage "<<Persistent Storage>>\nRender Persistent Disk" as Volume
+    }
+  }
+
+  node "<<Render Observability>>\nHealth Probe & Central Logs" as Monitor #FEF9C3
+}
+
+' ================= LUỒNG KẾT NỐI ĐƠN GIẢN, KHÔNG CẮT CHÉO =================
+LocalHost -right-> Pipeline : "1. Git Push / PR"
+Pipeline -down-> Images : "2. Build & Push"
+Images ..> PrivateNet : "3. Deploy Hook & Pull Images\n(+ Smoke Test GET /health)"
+
+PWA -down-> RenderEdge : "4. HTTPS (:443)\n[Bearer JWT, Idempotency-Key]"
+RenderEdge -down-> WebNode : "5a. Web URL (HTTPS)"
+RenderEdge -down-> ApiNode : "5b. API URL (HTTPS)"
+
+WebNode <-> ApiNode : "6. SSR Call &\nPOST /api/mock-pay"
+
+ApiNode -down-> Postgres : "7. PostgreSQL TCP (:5432)"
+Postgres -right-> Volume : "8. Lưu trữ bền vững"
+
+ApiNode <-> Monitor : "9. GET /health & Logs"
+
+@enduml
