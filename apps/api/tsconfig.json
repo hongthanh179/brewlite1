@@ -15,6 +15,7 @@
     "isolatedModules": true,
     "strictPropertyInitialization": false,
     "strictNullChecks": false,
-    "noImplicitAny": false
+    "noImplicitAny": false,
+    "types": ["jest", "node"]
   }
 }

@@ -190,7 +190,7 @@ CREATE TABLE "Notification" (
 );
 
 -- CreateTable
-CREATE TABLE "_CategoryToTopping" (
+CREATE TABLE "_CategoryToppings" (
     "A" INTEGER NOT NULL,
     "B" INTEGER NOT NULL
 );
@@ -226,10 +226,10 @@ CREATE INDEX "Notification_audience_isRead_createdAt_idx" ON "Notification"("aud
 CREATE INDEX "Notification_userId_isRead_idx" ON "Notification"("userId", "isRead");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "_CategoryToTopping_AB_unique" ON "_CategoryToTopping"("A", "B");
+CREATE UNIQUE INDEX "_CategoryToppings_AB_unique" ON "_CategoryToppings"("A", "B");
 
 -- CreateIndex
-CREATE INDEX "_CategoryToTopping_B_index" ON "_CategoryToTopping"("B");
+CREATE INDEX "_CategoryToppings_B_index" ON "_CategoryToppings"("B");
 
 -- AddForeignKey
 ALTER TABLE "Product" ADD CONSTRAINT "Product_categoryId_fkey" FOREIGN KEY ("categoryId") REFERENCES "Category"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -265,7 +265,7 @@ ALTER TABLE "Payment" ADD CONSTRAINT "Payment_orderId_fkey" FOREIGN KEY ("orderI
 ALTER TABLE "Notification" ADD CONSTRAINT "Notification_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "_CategoryToTopping" ADD CONSTRAINT "_CategoryToTopping_A_fkey" FOREIGN KEY ("A") REFERENCES "Category"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "_CategoryToppings" ADD CONSTRAINT "_CategoryToppings_A_fkey" FOREIGN KEY ("A") REFERENCES "Category"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "_CategoryToTopping" ADD CONSTRAINT "_CategoryToTopping_B_fkey" FOREIGN KEY ("B") REFERENCES "Topping"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "_CategoryToppings" ADD CONSTRAINT "_CategoryToppings_B_fkey" FOREIGN KEY ("B") REFERENCES "Topping"("id") ON DELETE CASCADE ON UPDATE CASCADE;

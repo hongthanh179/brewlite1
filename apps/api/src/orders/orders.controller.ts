@@ -37,14 +37,14 @@ export class OrdersController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Tạo đơn hàng mới (Task 6 & Task 7 - Tự động nhận diện User qua JWT Token)',
+        'Tạo đơn hàng mới (Task 6 & Task 7 - Tự động nhận diện User qua JWT Token)',
   })
   create(@Req() req: any, @Body() createOrderDto: CreateOrderDto) {
-    const currentUserId = req.user?.id || req.user?.userId;
+    const currentUserId = req.user?.id || req.user?.userId || req.user?.sub;
 
     if (!currentUserId) {
       throw new BadRequestException(
-        'Không tìm thấy thông tin tài khoản! Vui lòng đăng nhập qua nút Authorize.',
+          'Không tìm thấy thông tin tài khoản! Vui lòng đăng nhập qua nút Authorize.',
       );
     }
 
@@ -58,7 +58,7 @@ export class OrdersController {
     summary: 'Lấy lịch sử đơn hàng của chính tài khoản đăng nhập (Task 9)',
   })
   findMyOrders(@Req() req: any) {
-    const currentUserId = req.user?.id || req.user?.userId;
+    const currentUserId = req.user?.id || req.user?.userId || req.user?.sub;
 
     if (!currentUserId) {
       throw new BadRequestException('Vui lòng đăng nhập để xem lịch sử đơn!');
@@ -80,12 +80,12 @@ export class OrdersController {
   async findOne(@Req() req: any, @Param('id', ParseIntPipe) id: number) {
     const order = await this.ordersService.findOne(id);
     const user = req.user;
-    const currentUserId = user?.id || user?.userId;
+    const currentUserId = user?.id || user?.userId || user?.sub;
 
     // Chặn nếu không phải Admin và cũng không phải chủ sở hữu của đơn
     if (user?.role !== Role.ADMIN && order.userId !== currentUserId) {
       throw new ForbiddenException(
-        'Bạn không có quyền xem chi tiết đơn hàng của người khác!',
+          'Bạn không có quyền xem chi tiết đơn hàng của người khác!',
       );
     }
 
@@ -97,7 +97,7 @@ export class OrdersController {
   // =========================================================================
 
   @Get()
-  @UseGuards(AuthGuard('jwt'), RolesGuard) //
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
   @Roles(Role.ADMIN)
   @ApiBearerAuth()
   @ApiOperation({
@@ -113,11 +113,11 @@ export class OrdersController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Cập nhật trạng thái đơn hàng (Task 10 - Order State Machine - Chỉ Admin)',
+        'Cập nhật trạng thái đơn hàng (Task 10 - Order State Machine - Chỉ Admin)',
   })
   updateStatus(
-    @Param('id', ParseIntPipe) id: number,
-    @Body() updateOrderDto: UpdateOrderDto,
+      @Param('id', ParseIntPipe) id: number,
+      @Body() updateOrderDto: UpdateOrderDto,
   ) {
     return this.ordersService.update(id, updateOrderDto);
   }
@@ -128,8 +128,8 @@ export class OrdersController {
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Cập nhật thông tin đơn hàng (Chỉ Admin)' })
   update(
-    @Param('id', ParseIntPipe) id: number,
-    @Body() updateOrderDto: UpdateOrderDto,
+      @Param('id', ParseIntPipe) id: number,
+      @Body() updateOrderDto: UpdateOrderDto,
   ) {
     return this.ordersService.update(id, updateOrderDto);
   }
