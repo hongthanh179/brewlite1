@@ -11,8 +11,8 @@ services:
     runtime: node
     rootDir: apps/api
     plan: free
-    branch: develop
-    buildCommand: npm install && npx prisma generate && npm run build
+    branch: main
+    buildCommand: npm install --include=dev && npx prisma generate && npm run build
     startCommand: npx prisma migrate deploy && npm run start:prod
     healthCheckPath: /api/health
     envVars:
@@ -31,8 +31,8 @@ services:
     runtime: node
     rootDir: apps/web
     plan: free
-    branch: develop
-    buildCommand: npm install && npm run build
+    branch: main
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm run start
     envVars:
       - key: NODE_ENV
