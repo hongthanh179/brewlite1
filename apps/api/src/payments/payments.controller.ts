@@ -6,10 +6,17 @@ import {
   Param,
   Headers,
   Query,
+  UseGuards,
   ParseIntPipe,
   BadRequestException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiHeader } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiHeader,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
 import { PaymentsService } from './payments.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { QueryPaymentDto } from './dto/query-payment.dto';
@@ -20,24 +27,26 @@ export class PaymentsController {
   constructor(private readonly paymentsService: PaymentsService) {}
 
   @Post()
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Xử lý thanh toán không tiền mặt (Mock Gateway, Idempotent, State Machine)',
+        'Xử lý thanh toán không tiền mặt (Mock Gateway, Idempotent, State Machine)',
   })
   @ApiHeader({
     name: 'idempotency-key',
     required: false,
     description:
-      'Idempotency Key (Có thể gửi qua HTTP Header hoặc bên trong Body)',
+        'Idempotency Key (Có thể gửi qua HTTP Header hoặc bên trong Body)',
   })
   create(
-    @Body() createPaymentDto: CreatePaymentDto,
-    @Headers('idempotency-key') headerKey?: string,
+      @Body() createPaymentDto: CreatePaymentDto,
+      @Headers('idempotency-key') headerKey?: string,
   ) {
     const key = createPaymentDto.idempotencyKey || headerKey;
     if (!key) {
       throw new BadRequestException(
-        'Bắt buộc phải cung cấp Idempotency-Key qua HTTP Header hoặc Body!',
+          'Bắt buộc phải cung cấp Idempotency-Key qua HTTP Header hoặc Body!',
       );
     }
     createPaymentDto.idempotencyKey = key;

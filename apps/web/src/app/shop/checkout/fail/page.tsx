@@ -14,53 +14,61 @@ function FailContent() {
     const orderCode = searchParams.get("orderCode") || orderId;
 
     return (
-        <div className="bg-[#FFFFFF] border border-[#E8E2D9] w-full max-w-md rounded-3xl p-8 shadow-xs text-center space-y-6">
-            {/* Icon thất bại đỏ */}
-            <div className="w-16 h-16 bg-[#FBE9E7] text-[#A12B1F] rounded-full flex items-center justify-center mx-auto">
-                <AlertCircle className="w-9 h-9" />
-            </div>
-
-            <div className="space-y-1.5">
-                <h1 className="text-2xl font-bold text-[#2B2118]">Thanh toán thất bại!</h1>
-                <p className="text-xs text-[#6B5E52]">
-                    Giao dịch chưa hoàn tất. Đơn nước của bạn đã được lưu để thanh toán lại.
-                </p>
-            </div>
-
-            {/* Box thông tin đơn hàng */}
-            <div className="bg-[#FAF7F2] border border-[#E8E2D9] rounded-2xl p-4 text-xs space-y-3 text-left">
-                <div className="flex justify-between items-center">
-                    <span className="text-[#6B5E52]">Mã đơn hàng:</span>
-                    <span className="font-mono font-bold text-[#2B2118]">#{orderCode || "---"}</span>
+        <div className="max-w-md mx-auto py-4 sm:py-8">
+            <div className="bg-white border border-[#E8E2D9] rounded-3xl p-5 sm:p-8 shadow-xs text-center space-y-5 sm:space-y-6">
+                {/* Icon thất bại đỏ */}
+                <div className="w-16 h-16 bg-[#FBE9E7] text-[#A12B1F] rounded-full flex items-center justify-center mx-auto ring-8 ring-[#FBE9E7]/50">
+                    <AlertCircle className="w-9 h-9 sm:w-10 sm:h-10" />
                 </div>
-                <div className="flex justify-between items-center">
-                    <span className="text-[#6B5E52]">Trạng thái:</span>
-                    <span className="font-bold text-[#A12B1F] bg-[#FBE9E7] border border-[#A12B1F]/20 px-2.5 py-0.5 rounded-full text-[11px]">
-                        ● PAYMENT_FAILED (CHƯA THANH TOÁN)
-                    </span>
+
+                <div className="space-y-1.5">
+                    <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-[#2B2118]">
+                        Thanh toán thất bại!
+                    </h1>
+                    <p className="text-xs sm:text-sm text-[#6B5E52] leading-relaxed">
+                        Giao dịch chưa hoàn tất. Đơn nước của bạn đã được lưu để thanh toán lại.
+                    </p>
                 </div>
-            </div>
 
-            {/* Nút hành động */}
-            <div className="space-y-2.5 pt-2">
-                <Button
-                    onClick={() => router.push(orderId ? `/shop/orders#order-${orderId}` : "/shop/orders")}
-                    className="w-full rounded-2xl py-6 font-bold bg-[#1A1A1A] hover:bg-[#000000] text-white flex items-center justify-center gap-2"
-                >
-                    <RotateCcw className="w-4 h-4" />
-                    Thanh toán lại ngay
-                </Button>
+                {/* Box thông tin đơn hàng */}
+                <div className="bg-[#FAF7F2] border border-[#E8E2D9] rounded-2xl p-3.5 sm:p-4 text-left space-y-3">
+                    <div className="flex justify-between items-center gap-2 text-xs sm:text-sm">
+                        <span className="text-[#6B5E52] shrink-0">Mã đơn hàng:</span>
+                        <span className="font-mono font-bold text-[#2B2118] bg-white px-2.5 py-1 rounded-lg border border-[#E8E2D9] truncate">
+                            #{orderCode || "---"}
+                        </span>
+                    </div>
+                    <div className="flex justify-between items-center gap-2 text-xs sm:text-sm">
+                        <span className="text-[#6B5E52] shrink-0">Trạng thái:</span>
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-[#FBE9E7] text-[#A12B1F] whitespace-nowrap">
+                            ● Chưa thanh toán
+                        </span>
+                    </div>
+                </div>
 
-                <Button
-                    asChild
-                    variant="ghost"
-                    className="w-full rounded-2xl text-xs text-[#6B5E52] hover:text-[#2B2118]"
-                >
-                    <Link href="/shop" className="flex items-center justify-center gap-1.5">
-                        <Coffee className="w-4 h-4" />
-                        Tiếp tục gọi món
-                    </Link>
-                </Button>
+                {/* Nút hành động */}
+                <div className="space-y-2.5 pt-1">
+                    <Button
+                        onClick={() =>
+                            router.push(orderId ? `/shop/orders#order-${orderId}` : "/shop/orders")
+                        }
+                        className="w-full h-12 rounded-xl bg-[#2B2118] hover:bg-[#1A140E] text-white font-bold text-sm shadow-xs active:scale-[0.98] transition-transform flex items-center justify-center gap-2"
+                    >
+                        <RotateCcw className="w-4 h-4" />
+                        <span>Thanh toán lại ngay</span>
+                    </Button>
+
+                    <Button
+                        asChild
+                        variant="outline"
+                        className="w-full h-11 rounded-xl border-[#E8E2D9] bg-white text-[#2B2118] hover:bg-[#FAF7F2] font-semibold text-sm active:scale-[0.98] transition-transform"
+                    >
+                        <Link href="/shop" className="flex items-center justify-center gap-2">
+                            <Coffee className="w-4 h-4" />
+                            <span>Tiếp tục gọi món</span>
+                        </Link>
+                    </Button>
+                </div>
             </div>
         </div>
     );
@@ -68,17 +76,15 @@ function FailContent() {
 
 export default function CheckoutFailPage() {
     return (
-        <div className="w-full min-h-[80vh] flex items-center justify-center bg-[#FAF7F2] p-4">
-            <Suspense
-                fallback={
-                    <div className="flex flex-col items-center justify-center gap-2 text-xs text-[#6B5E52]">
-                        <Loader2 className="w-6 h-6 animate-spin text-[#B45F2B]" />
-                        <span>Đang tải thông tin đơn hàng...</span>
-                    </div>
-                }
-            >
-                <FailContent />
-            </Suspense>
-        </div>
+        <Suspense
+            fallback={
+                <div className="flex flex-col items-center justify-center py-20 gap-2 text-xs text-[#6B5E52]">
+                    <Loader2 className="w-6 h-6 animate-spin text-[#B45F2B]" />
+                    <span>Đang tải thông tin đơn hàng...</span>
+                </div>
+            }
+        >
+            <FailContent />
+        </Suspense>
     );
 }
