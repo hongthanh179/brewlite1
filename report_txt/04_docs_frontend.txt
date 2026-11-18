@@ -1,0 +1,3458 @@
+﻿
+==================== FILE: docs\deployment.md ====================
+
+
+
+
+==================== FILE: docs\traceability-matrix.md ====================
+
+
+
+
+==================== FILE: docs\architecture\activity-checkout.md ====================
+# Đặc tả Sơ đồ Hoạt động (Activity Diagram) – Luồng Đặt hàng & Thanh toán BrewLite
+
+> **Tệp tài liệu:** `docs/architecture/activity-checkout.md`
+> **Tạo phẩm liên quan:** `docs/diagrams/activity-checkout.puml`, `docs/diagrams/activity-checkout.png`, `docs/diagrams/activity-checkout.svg`
+> **Nhiệm vụ:** Task 2.1 – Activity diagram (Assignment 2)
+> **Phạm vi:** Đặt đơn hàng, thanh toán đơn hàng, xử lý thanh toán thất bại và hủy đơn
+
+---
+
+## 1. Mục tiêu và phạm vi
+
+Sơ đồ mô tả luồng hoạt động end-to-end từ lúc khách hàng bấm "Thanh toán" tại giỏ hàng đến khi đơn được thanh toán thành công, hoặc đơn bị hủy. Sơ đồ trả lời câu hỏi "ai làm gì, theo thứ tự nào, rẽ nhánh khi nào".
+
+Sơ đồ thể hiện đủ các yêu cầu của Task 2.1:
+
+- có điểm bắt đầu và các điểm kết thúc (thanh toán thành công, đơn giữ `PAYMENT_FAILED`, đơn bị hủy);
+- phân làn theo ba tác nhân: **Customer**, **System**, **Payment Gateway**;
+- có các nút quyết định (rẽ nhánh **Có** hoặc **Không**) và vòng lặp cho nhánh thành công và thất bại;
+- có đủ ba tình huống bắt buộc: **chưa đăng nhập**, **hết hàng**, **thanh toán thất bại**.
+
+---
+
+## 2. Sơ đồ hoạt động
+
+![Activity Diagram – Luồng Đặt hàng và Thanh toán](../diagrams/activity-checkout.png)
+
+```plantuml
+@startuml activity-checkout
+!pragma layout smetana
+
+skinparam conditionStyle diamond
+skinparam defaultFontName Arial
+skinparam wrapWidth 220
+skinparam maxMessageSize 220
+
+skinparam activity {
+  BackgroundColor White
+  BorderColor #2B2D42
+  FontSize 12
+}
+skinparam swimlane {
+  BorderColor #2B2D42
+  BorderThickness 1.5
+  TitleFontColor #1D3557
+  TitleFontSize 14
+}
+skinparam DefaultTextAlignment center
+
+title Activity Diagram - Luồng Đặt hàng & Thanh toán (BrewLite Checkout Flow)
+
+|#EBF5FB|Customer|
+|#FEF9E7|System|
+|#EAFAF1|Payment Gateway|
+
+|Customer|
+start
+:Mở màn hình Giỏ hàng;
+:Nhập mã giảm giá (nếu có);
+:Bấm nút "Thanh toán";
+
+' ===== KIỂM TRA ĐĂNG NHẬP & TỒN KHO =====
+|System|
+:Kiểm tra trạng thái đăng nhập;
+
+' SỬA LẠI ĐIỀU KIỆN ĐĂNG NHẬP ĐỂ HIỂN THỊ RÕ CÓ/KHÔNG
+if (Đã đăng nhập?) then (Có)
+  ' Đã đăng nhập thì đi tiếp
+else (Không)
+  |Customer|
+  :Đăng nhập;
+  |System|
+endif
+
+repeat
+  |System|
+  :Kiểm tra giỏ hàng & tồn kho;
+  
+  |Customer|
+backward: Hiển thị "Món đã hết hoặc không đủ số lượng"
+<size:10><i>Đơn không được tạo, không trừ tồn kho
+Khách cập nhật lại Giỏ hàng;
+  |System|
+' SỬA NHÃN VÒNG LẶP TỒN KHO THÀNH KHÔNG / CÓ
+repeat while (Đủ tồn kho?) is (Không) not (Có)
+
+:Tạo đơn hàng (PENDING)
+<size:10><i>Đơn chưa thanh toán quá thời hạn quy định
+<size:10><i>sẽ bị hệ thống tự hủy;
+:Trừ tồn kho & Tăng lượt dùng mã;
+
+|Customer|
+:Chọn phương thức (Ví / Thẻ);
+
+' ===== VÒNG LẶP THANH TOÁN =====
+repeat
+  |Customer|
+  :Client sinh Idempotency-Key mới
+  <size:10><i>Mỗi lượt thử lại sinh Key mới;
+  :Gửi yêu cầu thanh toán kèm Key;
+
+  |System|
+  :Chuyển yêu cầu sang cổng thanh toán;
+
+  |Payment Gateway|
+  :Xử lý giao dịch;
+
+  |System|
+  if (Giao dịch thành công?) then (Có)
+    :Cập nhật đơn hàng -> PAID;
+    :Cộng điểm tích lũy (10.000đ = 1 điểm);
+    :Làm trống Giỏ hàng;
+    :Gửi thông báo cho Quản trị viên;
+
+    |Customer|
+    :Hiển thị màn hình Đặt hàng thành công;
+    :Chuyển sang Theo dõi đơn hàng;
+    stop
+  else (Không)
+    |System|
+    :Cập nhật đơn hàng -> PAYMENT_FAILED;
+    :Gửi thông báo cho Quản trị viên;
+
+    |Customer|
+    :Hiển thị "Thanh toán thất bại";
+  endif
+' NHÃN VÒNG LẶP THỬ LẠI ĐÃ CHUẨN CÓ / KHÔNG
+repeat while (Khách hàng bấm "Thử lại"?) is (Có) not (Không)
+
+' ===== KHÔNG THỬ LẠI =====
+|Customer|
+:Đơn hàng giữ trạng thái PAYMENT_FAILED;
+:Khách có thể thanh toán lại từ "Đơn của tôi";
+stop
+
+' ===== NHÁNH HỦY ĐƠN (Xử lý ngầm định) =====
+|System|
+:Quá thời hạn thanh toán (hoặc Admin hủy);
+:Cập nhật đơn hàng -> CANCELLED;
+:Hoàn trả tồn kho & lượt dùng mã
+<size:10><i>Chưa cộng điểm nên không thu hồi;
+
+|Customer|
+:Hiển thị "Đơn hàng đã bị hủy";
+stop
+@enduml
+```
+
+---
+
+## 3. Các làn trách nhiệm (Swimlane)
+
+| Làn | Vai trò trong luồng | Hoạt động chính |
+|---|---|---|
+| **Customer** (khách hàng, giao diện web/PWA) | Khởi tạo và hoàn tất các thao tác của người dùng | Mở giỏ, nhập mã giảm giá, bấm "Thanh toán", đăng nhập, cập nhật giỏ, chọn Ví/Thẻ, sinh `Idempotency-Key`, gửi yêu cầu thanh toán, xem kết quả, bấm "Thử lại" |
+| **System** (BrewLite) | Kiểm tra nghiệp vụ, ghi nhận dữ liệu, điều phối thanh toán | Kiểm tra đăng nhập, giỏ hàng và tồn kho, tạo đơn, trừ tồn kho, chuyển yêu cầu sang cổng thanh toán, cập nhật trạng thái đơn, tích điểm, làm trống giỏ, thông báo cho quản trị viên, hủy đơn (quá hạn thanh toán hoặc Admin hủy) và hoàn trả |
+| **Payment Gateway** (cổng thanh toán mô phỏng) | Xử lý giao dịch Ví/Thẻ | Nhận yêu cầu, xử lý và trả kết quả thành công hoặc thất bại |
+
+---
+
+## 4. Thuyết minh luồng xử lý
+
+### 4.1. Khởi động và kiểm tra đăng nhập
+
+1. Khách hàng mở giỏ hàng, nhập mã giảm giá nếu có, rồi bấm "Thanh toán".
+2. Hệ thống kiểm tra trạng thái đăng nhập.
+   - **Có** (đã đăng nhập): đi tiếp trực tiếp.
+   - **Không** (chưa đăng nhập): khách được chuyển sang đăng nhập, sau đó quay lại luồng và tiếp tục kiểm tra giỏ hàng.
+
+### 4.2. Kiểm tra giỏ hàng và tồn kho
+
+3. Hệ thống kiểm tra từng món trong giỏ (còn bán, đủ số lượng) để hai khách cùng mua món cuối không làm tồn kho âm.
+4. **Không đủ tồn kho (tình huống hết hàng):** đơn không được tạo và không món nào bị trừ tồn kho. Khách thấy thông báo "Món đã hết hoặc không đủ số lượng" và cập nhật lại giỏ hàng. Luồng **quay lại bước 3** để kiểm tra lại giỏ hàng mới; vòng này lặp đến khi mọi món đều đủ số lượng.
+
+### 4.3. Tạo đơn
+
+5. Khi đủ tồn kho, hệ thống tạo đơn ở trạng thái `PENDING` (Chờ thanh toán), trừ số lượng tồn kho và tăng lượt dùng của mã giảm giá nếu có áp dụng.
+6. Đơn chưa thanh toán mà quá thời hạn quy định sẽ bị hệ thống tự hủy (xem bước 14).
+7. Khách chọn phương thức thanh toán: Ví hoặc Thẻ.
+
+### 4.4. Vòng lặp thanh toán
+
+8. Ứng dụng phía khách sinh một `Idempotency-Key` và gửi yêu cầu thanh toán kèm khóa này. Khi khách bấm "Thử lại", một khóa **mới** được sinh. Khi cùng một lần thanh toán bị gửi lặp (bấm đúp, mạng chậm), khóa giữ nguyên nên hệ thống nhận ra và chỉ tính tiền một lần.
+9. Hệ thống chuyển yêu cầu sang cổng thanh toán; cổng xử lý giao dịch và trả kết quả.
+10. **Giao dịch thành công (Có):**
+    - đơn chuyển `PAID`;
+    - cộng điểm tích lũy theo quy tắc 10.000đ = 1 điểm;
+    - làm trống giỏ hàng;
+    - gửi thông báo cho quản trị viên;
+    - khách thấy màn hình "Đặt hàng thành công" và được chuyển sang theo dõi đơn hàng. **Kết thúc luồng.**
+11. **Giao dịch thất bại (Không):**
+    - đơn chuyển `PAYMENT_FAILED`;
+    - gửi thông báo cho quản trị viên;
+    - khách thấy "Thanh toán thất bại".
+12. **Khách bấm "Thử lại" (Có):** quay lại bước 8 với khóa mới (có thể đổi phương thức).
+
+### 4.5. Khách không thử lại và nhánh hủy đơn
+
+13. **Khách không bấm "Thử lại" (Không):** hệ thống không hủy đơn ngay. Đơn giữ trạng thái `PAYMENT_FAILED`; khách có thể thanh toán lại từ "Đơn của tôi". **Kết thúc nhánh này.**
+14. **Nhánh hủy đơn (xử lý ngầm định):** đơn chưa thanh toán bị hủy khi quá thời hạn thanh toán hoặc khi Admin hủy. Hệ thống cập nhật đơn sang `CANCELLED`, hoàn trả tồn kho và lượt dùng mã giảm giá. Do đơn chưa thanh toán thành công nên chưa cộng điểm và không cần thu hồi điểm. Khách thấy "Đơn hàng đã bị hủy". **Kết thúc luồng.**
+
+Nhánh hủy đơn không nối bằng mũi tên từ các bước trên vì việc hủy xảy ra theo thời gian hoặc do Admin, độc lập với thao tác của khách.
+
+---
+
+## 5. Các nút quyết định (Decision)
+
+Mỗi nút quyết định trên sơ đồ có hai nhánh **Có** và **Không**, được mô tả trong bảng sau.
+
+| Nút quyết định | Điều kiện | Nhánh "Có" | Nhánh "Không" |
+|---|---|---|---|
+| Đã đăng nhập? | Khách có phiên đăng nhập hợp lệ | Tiếp tục kiểm tra giỏ hàng | Khách đăng nhập rồi tiếp tục |
+| Đủ tồn kho? | Mọi món trong giỏ còn đủ số lượng | Tạo đơn `PENDING` | Báo hết hàng, khách cập nhật giỏ, **quay lại bước kiểm tra giỏ hàng & tồn kho** |
+| Giao dịch thành công? | Cổng thanh toán xác nhận thành công | Đơn `PAID`, kết thúc thành công | Đơn `PAYMENT_FAILED`, báo lỗi cho khách |
+| Khách bấm "Thử lại"? | Khách chọn thanh toán lại | Quay lại vòng lặp thanh toán | Đơn giữ `PAYMENT_FAILED`; khách có thể thanh toán lại từ "Đơn của tôi" |
+
+---
+
+## 6. Các kịch bản ngoại lệ cốt lõi
+
+| Tình huống | Vị trí trên sơ đồ | Kết quả |
+|---|---|---|
+| Chưa đăng nhập | Nút "Đã đăng nhập?" nhánh "Không" | Khách đăng nhập rồi quay lại luồng đặt đơn |
+| Hết hàng | Nút "Đủ tồn kho?" nhánh "Không" | Báo món hết hoặc không đủ số lượng; khách cập nhật giỏ; không tạo đơn, không trừ tồn kho; kiểm tra lại giỏ mới |
+| Thanh toán thất bại | Nút "Giao dịch thành công?" nhánh "Không" và nút "Khách bấm Thử lại?" | Đơn `PAYMENT_FAILED`; khách thử lại với khóa mới, hoặc thanh toán lại sau từ "Đơn của tôi"; đơn bị hủy khi quá hạn thanh toán hoặc Admin hủy |
+
+Các ngoại lệ chi tiết hơn (mã giảm giá không dùng được, thanh toán quá thời gian chờ chưa rõ kết quả) được mô tả ở `usecase-checkout.md` và `sequence-checkout.md`, không vẽ lại ở đây để sơ đồ dễ đọc.
+
+---
+
+## 7. Trạng thái đơn hàng đi qua luồng
+
+```text
+   (Tạo đơn)
+       │
+       ▼
+  [ PENDING ] ─────────────(Thành công)─────────────► [ PAID ] ──► (Theo dõi đơn)
+       │                                                  ▲
+       │ (Thất bại)                                       │ (Thanh toán lại thành công)
+       ▼                                                  │
+ [ PAYMENT_FAILED ] ──────────────────────────────────────┘
+       │
+       │ (Quá hạn thanh toán hoặc Admin hủy)
+       ▼
+  [ CANCELLED ] ───────────────► (Kết thúc luồng)
+
+  (PENDING cũng chuyển sang CANCELLED khi quá hạn thanh toán hoặc Admin hủy)
+```
+
+*(Ghi chú: Sơ đồ mô tả phạm vi từ lúc đặt đơn đến khi thanh toán thành công hoặc đơn bị hủy khi chưa thanh toán. Quy trình pha chế và giao nhận đồ uống sau trạng thái `PAID` không thuộc phạm vi của sơ đồ hoạt động này.)*
+
+---
+
+## 8. Ma trận truy vết yêu cầu (Traceability Matrix)
+
+Cột **Mã Yêu cầu** ghi mã yêu cầu chức năng (FR-xx) và yêu cầu phi chức năng (NFR-xx) mà hoạt động đáp ứng; cột **Mã Tiêu chí chấp nhận** ghi mã AC trong `srs.md` dùng để kiểm chứng hoạt động đó (AC-xx.y cho FR, AC-Nxx.y cho NFR).
+
+| Hoạt động trên sơ đồ | Mã Yêu cầu (FR) | Mã Tiêu chí chấp nhận (AC) | Mô tả kết quả |
+|---|---|---|---|
+| Mở giỏ, nhập mã giảm giá, bấm "Thanh toán" | FR-03, FR-05 | AC-03.4, AC-05.8 – AC-05.11 | Khách bắt đầu quy trình thanh toán; mã giảm giá (nếu có) được ghi nhận cho đơn |
+| Kiểm tra đăng nhập, đăng nhập | FR-03, FR-04; NFR-02 | AC-03.9, AC-04.5, AC-04.8, AC-04.9, AC-N02.4 | Khách chưa đăng nhập được yêu cầu đăng nhập trước khi tiếp tục; khách đã đăng nhập đi tiếp |
+| Kiểm tra tồn kho, báo hết hàng, kiểm tra lại | FR-05; NFR-03, NFR-05 | AC-05.4, AC-05.13, AC-N05.2, AC-N03.4 | Món không đủ số lượng bị từ chối kèm thông báo; không tạo đơn và không trừ tồn kho; hai khách cùng mua món cuối thì chỉ một khách đặt được |
+| Tạo đơn `PENDING`, trừ tồn kho, tăng lượt dùng mã | FR-05; NFR-05 | AC-05.1, AC-05.2, AC-05.3, AC-05.12, AC-N05.1 | Đơn được tạo ở trạng thái Chờ thanh toán; tồn kho giảm đúng số lượng đặt; lượt dùng mã tăng thêm 1 nếu có áp dụng |
+| Chọn phương thức, gửi yêu cầu kèm `Idempotency-Key` | FR-06; NFR-05 | AC-06.7, AC-06.11, AC-N05.3 | Mỗi lần thanh toán có một khóa riêng; gửi lặp cùng khóa chỉ bị tính tiền một lần |
+| Thanh toán thành công | FR-06; NFR-02 | AC-06.1, AC-06.2, AC-06.3, AC-06.4, AC-N02.5 | Đơn chuyển `PAID`; điểm tích lũy được cộng; giỏ hàng được làm trống; quản trị viên được thông báo; khách thấy màn hình đặt hàng thành công |
+| Thanh toán thất bại và thử lại | FR-06, FR-07; NFR-03, NFR-05 | AC-06.5, AC-06.6, AC-06.13, AC-07.7, AC-N03.4 | Đơn chuyển `PAYMENT_FAILED`; quản trị viên được thông báo; khách thấy lỗi, có thể thử lại bằng khóa mới hoặc thanh toán lại từ "Đơn của tôi" |
+| Chuyển sang theo dõi đơn | FR-07; NFR-02 | AC-07.1, AC-07.2, AC-07.4, AC-N02.2 | Khách xem được trạng thái đơn vừa đặt |
+| Hủy đơn (quá hạn thanh toán hoặc Admin hủy), hoàn trả | FR-07, FR-08; NFR-05 | AC-08.7, AC-07.8 | Đơn chuyển `CANCELLED`; tồn kho và lượt dùng mã được hoàn trả; không thu hồi điểm vì chưa cộng; khách thấy trạng thái "Đã hủy" |
+
+
+
+==================== FILE: docs\architecture\c4-model.md ====================
+# BrewLite – Mô hình kiến trúc C4 (Context và Container)
+
+| Mục | Nội dung |
+|---|---|
+| Phương pháp | C4 Model: mức 1 (System Context) và mức 2 (Container); kiến trúc phân lớp bên trong Backend |
+| Phiên bản | 1.2 |
+| Nguồn sơ đồ (PlantUML) | [`../diagrams/c4-context.puml`](../diagrams/c4-context.puml), [`../diagrams/c4-container.puml`](../diagrams/c4-container.puml) |
+| Ảnh kết xuất | `../diagrams/c4-context.png`, `../diagrams/c4-container.png` |
+| Quyết định kiến trúc | [`adr/`](adr/README.md) |
+| Liên quan | `../requirements/context-and-scope.md`, `../traceability-matrix.md` |
+
+---
+
+## 1. C1 – System Context
+
+Cho thấy BrewLite trong môi trường của nó: ai dùng hệ thống và hệ thống ngoài nào nó phụ thuộc vào.
+
+![C1 – System Context](../diagrams/c4-context.png)
+
+| Thành phần | Loại | Vai trò |
+|---|---|---|
+| **Customer** | Person | Khách hàng: xem menu, chọn size/topping, đặt đơn, thanh toán, theo dõi và xem lịch sử đơn (stakeholder S1). |
+| **Admin** | Person | Nhân viên quầy hoặc quản lý (vai trò `ADMIN`): tiếp nhận đơn, cập nhật trạng thái chế biến, quản lý sản phẩm (S2, S3). |
+| **BrewLite System** | Software System | Hệ thống đặt đồ uống trực tuyến: menu, giỏ hàng, đặt đơn chống bán vượt tồn kho (khóa lạc quan), thanh toán chống trùng lặp (idempotent), theo dõi đơn. |
+| **Mock Payment Service** | External System | Dịch vụ thanh toán mô phỏng Ví/Thẻ, trả kết quả thành công hoặc thất bại (S6). |
+
+| Từ | Đến | Mục đích | Giao thức |
+|---|---|---|---|
+| Customer | BrewLite System | Sử dụng ứng dụng trên thiết bị di động / PWA | HTTPS |
+| Admin | BrewLite System | Quản lý đơn hàng và thực đơn qua trình duyệt | HTTPS |
+| BrewLite System | Mock Payment Service | Gửi yêu cầu thanh toán (kèm Idempotency-Key), nhận kết quả | HTTPS, JSON |
+
+---
+
+## 2. C2 – Container
+
+Mở hộp BrewLite System thành các container chạy và triển khai được độc lập. "Container" ở đây là một ứng dụng hoặc kho dữ liệu chạy riêng, không nhất thiết là Docker container.
+
+![C2 – Container](../diagrams/c4-container.png)
+
+### 2.1 Vai trò của từng container
+
+| Container | Công nghệ | Mã nguồn | Cổng | Vai trò |
+|---|---|---|---|---|
+| **Frontend** | Next.js (mobile-first, PWA) | `../../apps/web` | 3000 | Hiển thị giao diện menu, giỏ hàng, checkout, lịch sử và theo dõi đơn, màn hình Admin. Gọi Backend qua REST, không truy cập trực tiếp cơ sở dữ liệu. |
+| **Backend** | NestJS REST API | `../../apps/api` | 3001 | Xác thực và phân quyền JWT, validate dữ liệu, xử lý nghiệp vụ (tạo đơn, trừ tồn kho bằng khóa lạc quan qua trường `version`, thanh toán idempotent, Order State Machine), health check `GET /health`. Là thành phần duy nhất truy cập cơ sở dữ liệu. |
+| **Database** | PostgreSQL 16 (Docker) | Migration và seed trong `../../apps/api` | 5432 | Lưu người dùng, sản phẩm, kích cỡ/topping, đơn hàng, thanh toán, mã giảm giá (Coupon), điểm tích lũy (Loyalty), thông báo; schema quản lý qua Prisma migration. |
+
+### 2.2 Giao thức giữa các khối
+
+| Từ | Đến | Giao thức | Nội dung trao đổi |
+|---|---|---|---|
+| Customer / Admin | Frontend | HTTPS | Tải trang và tài nguyên PWA |
+| Frontend | Backend | REST, JSON qua HTTPS, header `Authorization: Bearer <JWT>` | `GET /products`, `GET /products/:id`, đăng ký/đăng nhập, tạo đơn, thanh toán, lịch sử và trạng thái đơn |
+| Backend | Database | Prisma Client qua TCP, cổng 5432 | Truy vấn và ghi dữ liệu; transaction khi tạo đơn và cập nhật tồn kho |
+| Backend | Mock Payment Service | HTTPS, JSON, kèm `Idempotency-Key` | Yêu cầu thanh toán và kết quả thành công/thất bại |
+
+Ghi chú:
+
+- Cổng 3000, 3001, 5432 là cổng khi chạy local bằng `../../docker-compose.yml`. Ở production, người dùng chỉ truy cập qua HTTPS (443) và cơ sở dữ liệu không mở ra Internet.
+- Frontend gọi Backend từ cả phía server (SSR) lẫn trình duyệt, nên Backend cần bật CORS cho domain của Frontend và địa chỉ API lấy từ biến môi trường (mục 4.3).
+- Mock Payment Service là hệ thống ngoài về mặt logic. Trong MVP nó chạy dưới dạng module trong `apps/api` (xem [ADR-008](adr/008-mock-payment-service.md)); deployment diagram phải thể hiện đúng điều này.
+
+---
+
+## 3. Thuyết minh kiến trúc và trade-off
+
+### 3.1 Phong cách kiến trúc
+
+BrewLite dùng **kiến trúc ba tầng (Frontend – Backend – Database)**, trong đó Backend là **modular monolith** chia module theo domain và phân lớp bên trong; toàn bộ nằm trong **một monorepo** ([ADR-001](adr/001-monorepo.md), [ADR-003](adr/003-nestjs-modular-layered-backend.md)).
+
+Lý do chọn:
+- Nghiệp vụ cốt lõi (tạo đơn, trừ kho, thanh toán) cần **một transaction cơ sở dữ liệu duy nhất**; microservices sẽ buộc phải xử lý giao dịch phân tán.
+- Nhóm nhỏ, hai sprint, hạ tầng giới hạn: một đơn vị triển khai cho Backend là đủ và dễ vận hành.
+- Ranh giới module rõ ràng cho phép tách dịch vụ riêng sau này nếu cần.
+
+### 3.2 Cấu trúc bên trong Backend
+
+```
+Controller (HTTP, DTO, validate)  →  Service (nghiệp vụ, transaction)  →  Prisma Client  →  PostgreSQL
+                                          └──→ PaymentGateway (HTTP)  →  Mock Payment Service
+```
+
+| Module | Trách nhiệm | Mã nguồn |
+|---|---|---|
+| `AuthModule`, `UsersModule` | Đăng ký, đăng nhập, JWT, phân quyền `CUSTOMER`/`ADMIN` | `../../apps/api/src/auth`, `users` |
+| `CatalogModule` | Sản phẩm, danh mục, size, topping | `../../apps/api/src/catalog` |
+| `OrdersModule` | Tạo đơn, trừ kho, Order State Machine, lịch sử đơn | `../../apps/api/src/orders` |
+| `PaymentsModule` | Thanh toán, idempotency, gọi `PaymentGateway` | `../../apps/api/src/payments` |
+| `CouponsModule`, `NotificationsModule` | Mở rộng (Should/Could) | `../../apps/api/src/coupons`, `notifications` |
+| `HealthModule`, `Common` | Health check, cấu hình, logging, filter lỗi | `../../apps/api/src/health`, `common` |
+
+Tên thư mục là quy ước đề xuất; cập nhật bảng này nếu cấu trúc code thực tế khác.
+
+### 3.3 Lý do chọn, ưu điểm, hạn chế và đánh đổi
+
+| Quyết định | Lý do chọn | Ưu điểm | Hạn chế / đánh đổi | ADR |
+|---|---|---|---|---|
+| **Monorepo** | Hai ứng dụng, tài liệu và test cần truy vết cùng nhau | Một PR sửa cả web, API, docs; clone một lần | CI có thể chạy thừa; không tự chia sẻ kiểu dữ liệu | [001](adr/001-monorepo.md) |
+| **Next.js PWA, giỏ hàng ở client** | Khách dùng điện thoại; không có bảng Cart | Tải nhanh nhờ SSR, cài được như app; Backend đơn giản | Giỏ hàng không đồng bộ giữa thiết bị; polling có độ trễ | [002](adr/002-nextjs-pwa-frontend.md) |
+| **NestJS modular monolith** | Cần transaction duy nhất, nhóm nhỏ | Dễ vận hành, dễ test, có thể tách sau | Scale cả khối, lỗi lan toàn API | [003](adr/003-nestjs-modular-layered-backend.md) |
+| **PostgreSQL + Prisma migration** | Đề bắt buộc; dữ liệu quan hệ cần ACID | Schema có lịch sử, kiểu an toàn, tái tạo DB dễ | Thêm bước `prisma generate`; truy vấn phức tạp cần SQL thô | [004](adr/004-postgresql-prisma-migration.md) |
+| **JWT Bearer, RBAC** | Frontend và API khác origin, API stateless | Không cần kho session | Không thu hồi token; rủi ro XSS khi lưu token ở client | [005](adr/005-jwt-authentication-rbac.md) |
+| **Khóa lạc quan khi trừ kho** | Không bán vượt tồn khi đặt đồng thời | Không giữ khoá lâu, thông lượng tốt | Món hot có thể phải thử lại/409 | [006](adr/006-optimistic-locking-stock.md) |
+| **Thanh toán idempotent** | Mạng chập chờn, bấm nhiều lần | Gửi lại an toàn, kết quả nhất quán | Client phải quản lý key đúng cách | [007](adr/007-idempotent-payment.md) |
+| **Mock Payment sau `PaymentGateway`** | Chỉ cần thanh toán mô phỏng, nhưng phải thay được | Đổi sang cổng thật bằng adapter | Mock cùng tiến trình với API | [008](adr/008-mock-payment-service.md) |
+| **Order State Machine, snapshot** | Nhiều bên đổi trạng thái; giá có thể đổi | Trạng thái dự đoán được, lịch sử đúng | Đơn bỏ dở giữ tồn kho; không huỷ được đơn đã thanh toán | [009](adr/009-order-state-machine-and-snapshot.md) |
+| **Log JSON, health, cấu hình env** | Truy vết, smoke test, an toàn secret | Truy vết theo `requestId`; fail-fast khi thiếu cấu hình | Không có dashboard/cảnh báo | [010](adr/010-logging-health-config.md) |
+
+### 3.4 Thuộc tính chất lượng
+
+| Thuộc tính | Cách kiến trúc đáp ứng | Giới hạn |
+|---|---|---|
+| Hiệu năng | SSR cho menu, truy vấn có chỉ mục, không giữ khoá lâu | Chưa có cache; phụ thuộc gói hạ tầng miễn phí |
+| Bảo mật | Băm mật khẩu, JWT, RBAC, validate hai phía, secret ngoài repo, DB không public | Không refresh token; token lưu ở client |
+| Tính khả dụng | Health/readiness, restart theo nền tảng | Một bản sao Backend, không dự phòng |
+| Nhất quán dữ liệu | Transaction, khóa lạc quan, idempotency | Đơn bỏ dở giữ kho (ADR-009) |
+| Khả năng kiểm thử | Phân lớp, `PaymentGateway` thay được bằng mock | Cần dựng DB test cho integration test |
+| Khả năng triển khai | Docker, migration, health check, CI/CD | Chạy migration an toàn cần quy trình riêng (`docs/deployment.md`) |
+
+### 3.5 Hạn chế đã biết và hướng mở rộng
+
+- Chưa có hàng đợi hay cache; thanh toán xử lý đồng bộ trong một request.
+- Trạng thái đơn cập nhật bằng polling, chưa có đẩy thời gian thực.
+- Chưa tự động huỷ đơn quá hạn để nhả tồn kho.
+- Chưa có refresh token và chưa thu hồi được phiên đăng nhập.
+- Hướng mở rộng: tách Mock Payment thành dịch vụ riêng hoặc thay bằng cổng thật qua `PaymentGateway`, thêm cache menu, thêm tác vụ nền (huỷ đơn quá hạn, thông báo).
+
+---
+
+## 4. Quản trị hệ thống
+
+### 4.1 Logging
+
+Chi tiết tại [ADR-010](adr/010-logging-health-config.md).
+
+| Nội dung | Giải pháp |
+|---|---|
+| Định dạng | JSON có cấu trúc, ghi ra stdout (ví dụ `nestjs-pino`) |
+| Truy vết | `requestId` từ header `x-request-id` hoặc tự sinh, trả lại trong response |
+| Mức log | `LOG_LEVEL`: `debug` ở local, `info` ở production |
+| Tập trung | `docker compose logs` ở local; trình xem log của nền tảng ở production |
+| Che dữ liệu nhạy cảm | Không ghi `authorization`, mật khẩu, `passwordHash`, token thanh toán, `JWT_SECRET` |
+| Sự kiện ghi lại | Tạo đơn, kết quả thanh toán, xung đột tồn kho, đổi trạng thái đơn, lỗi 5xx |
+
+### 4.2 Health check
+
+| Endpoint | Mục đích | Phản hồi |
+|---|---|---|
+| `GET /health` | Liveness: tiến trình còn sống | 200 `{"status":"ok"}` |
+| `GET /health/ready` | Readiness: kiểm tra kết nối PostgreSQL (`SELECT 1`) | 200 khi sẵn sàng, 503 khi DB lỗi |
+
+Dùng trong `healthcheck` của `docker-compose.yml` (API chỉ được gọi khi DB sẵn sàng), health check của nền tảng và smoke test sau triển khai.
+
+### 4.3 Quản lý cấu hình
+
+Cấu hình đọc từ biến môi trường, kiểm tra schema khi khởi động (thiếu biến bắt buộc thì không chạy). `.env.example` chỉ chứa tên biến, `.env` nằm trong `.gitignore`.
+
+| Biến | Thành phần | Mô tả | Bí mật |
+|---|---|---|---|
+| `NODE_ENV` | API, Web | `development` / `production` | Không |
+| `PORT` | API | Cổng lắng nghe (3001) | Không |
+| `DATABASE_URL` | API | Chuỗi kết nối PostgreSQL | **Có** |
+| `JWT_SECRET` | API | Khoá ký JWT | **Có** |
+| `JWT_EXPIRES_IN` | API | Thời hạn access token | Không |
+| `CORS_ORIGIN` | API | Domain Frontend được phép gọi | Không |
+| `LOG_LEVEL` | API | Mức log | Không |
+| `PAYMENT_GATEWAY_URL` | API | Địa chỉ cổng thanh toán (mock) | Không |
+| `PAYMENT_MOCK_ENABLED` | API | Bật module mock thanh toán | Không |
+| `PAYMENT_TIMEOUT_MS` | API | Thời gian chờ cổng thanh toán | Không |
+| `NEXT_PUBLIC_API_URL` | Web | Địa chỉ API cho trình duyệt (nhúng lúc build) | Không |
+| `API_INTERNAL_URL` | Web | Địa chỉ API cho SSR trong mạng nội bộ | Không |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Database | Khởi tạo PostgreSQL | **Có** (mật khẩu) |
+
+| Môi trường | Nguồn giá trị |
+|---|---|
+| Local | File `.env` (sao chép từ `.env.example`), nạp qua `docker-compose.yml` |
+| CI | Secret của GitHub Actions |
+| Production | Secret/biến môi trường của nền tảng triển khai |
+
+Biến `NEXT_PUBLIC_*` được nhúng vào bundle lúc build nên không bao giờ chứa secret.
+
+### 4.4 Migration và seed
+
+| Môi trường | Lệnh | Ghi chú |
+|---|---|---|
+| Local | `prisma migrate dev`, `prisma db seed` | Tạo và áp dụng migration, nạp dữ liệu mẫu |
+| CI/CD, production | `prisma migrate deploy` | Chạy trước khi khởi động phiên bản mới; migration tương thích ngược để rollback ứng dụng không cần rollback schema |
+
+---
+
+## 5. Truy vết
+
+| Thành phần | Mã nguồn | Liên quan |
+|---|---|---|
+| Frontend | `../../apps/web` | Ràng buộc C1, C15 trong `context-and-scope.md`; ADR-002 |
+| Backend | `../../apps/api` | Ràng buộc C2, C14; ADR-003, 005, 006, 007, 009 |
+| Database | `../../apps/api/prisma` (migration, seed), `../../docker-compose.yml` | Ràng buộc C3, C4; ADR-004 |
+| Mock Payment Service | Module `mock-payment` trong `../../apps/api` | Stakeholder S6, giả định A7; ADR-008 |
+| Logging, health, cấu hình | `../../apps/api/src/common`, `health`; `../../.env.example` | Ràng buộc C10; ADR-010 |
+
+---
+
+## 6. Cách chỉnh sửa và kết xuất sơ đồ
+
+Sửa file `.puml`, kết xuất lại ra PNG rồi commit cả hai file cùng nhau:
+
+```bash
+docker run --rm -v "$(pwd)/docs/diagrams:/data" plantuml/plantuml -tpng /data/c4-context.puml /data/c4-container.puml
+```
+
+(PowerShell: thay `$(pwd)` bằng `${PWD}`.) Hoặc dùng extension **PlantUML** trong VS Code / WebStorm rồi chọn *Export Current Diagram* định dạng PNG.
+
+---
+
+## 7. Lịch sử thay đổi
+
+| Phiên bản | Ngày | Nội dung / Lý do |
+|---|---|---|
+| 1.0 | 02/11/2026 | Khởi tạo C1 và C2 |
+| 1.1 | 04/11/2026 | Chuyển sang định dạng PNG, đồng bộ thực thể cơ sở dữ liệu và cơ chế khóa lạc quan |
+| 1.2 | 04/11/2026 | Thêm thuyết minh và trade-off (mục 3), quản trị hệ thống gồm logging, health, cấu hình (mục 4), liên kết ADR; sửa mô tả BrewLite System ở C1 |
+
+
+
+==================== FILE: docs\architecture\class-diagram.md ====================
+# Thiết kế Sơ đồ Lớp Hệ thống (Class Diagram) – BrewLite
+
+> **Tệp tài liệu:** `docs/architecture/class-diagram.md`  
+> **Tạo phẩm liên quan:** `docs/diagrams/design-class-diagram.puml`, `docs/diagrams/design-class-diagram.png`  
+> **Giai đoạn:** Task 2 – Mô hình hóa hệ thống (Mục 4.3 Assignment 2)  
+> **Phiên bản:** 1.1 (Đồng bộ với Prisma Schema & PostgreSQL) | Phạm vi: MVP
+
+---
+
+## 1. Mục tiêu và phạm vi thiết kế
+
+Tài liệu này đặc tả cấu trúc dữ liệu và mô hình lớp ở mức miền (Domain Class Diagram) cho hệ thống BrewLite, làm nền tảng trực tiếp cho:
+1. **Yêu cầu nghiệp vụ (Task 1):** Khớp với 8 nhóm yêu cầu chức năng `FR-01` – `FR-08` và các tiêu chí chất lượng `NFR-02`, `NFR-05` trong `srs.md`.
+2. **Sơ đồ hành vi (Task 2):** Đồng bộ tên thuộc tính, phương thức và enum với Activity Diagram (`activity-checkout`) và Sequence Diagram (`sequence-checkout`).
+3. **Hiện thực kỹ thuật (Task 3 & 4):** Ánh xạ trực tiếp 1-1 sang cơ sở dữ liệu PostgreSQL thông qua lược đồ Prisma ORM (`apps/api/prisma/schema.prisma`).
+
+---
+
+## 2. Sơ đồ lớp mức miền (Domain Class Diagram)
+
+![Domain Class Diagram](../diagrams/design-class-diagram.png)
+
+```plantuml
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam roundcorner 6
+skinparam dpi 150
+skinparam class {
+  BackgroundColor #FFFFFF
+  ArrowColor #181818
+  BorderColor #181818
+}
+
+' ================= ENUMS =================
+enum Role {
+  CUSTOMER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  PREPARING
+  READY
+  COMPLETED
+  PAYMENT_FAILED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  WALLET
+  CARD
+}
+
+enum PaymentStatus {
+  SUCCESS
+  FAILED
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+enum LoyaltyType {
+  EARN
+  REVERT
+}
+
+' ================= DOMAIN ENTITIES =================
+class User {
+  + id: Int [PK]
+  + email: String
+  + passwordHash: String
+  + name: String
+  + phone: String
+  + loyaltyPoints: Int
+  + role: Role
+  + isActive: Boolean
+  + createdAt: DateTime
+  + updatedAt: DateTime
+}
+
+class Product {
+  + id: Int [PK]
+  + name: String
+  + price: Int
+  + description: String
+  + stock: Int
+  + version: Int
+  + isActive: Boolean
+  + categoryId: Int [FK]
+  + createdAt: DateTime
+  + updatedAt: DateTime
+  + checkStock(qty: Int): Boolean
+}
+
+class Order {
+  + id: Int [PK]
+  + userId: Int [FK]
+  + couponId: Int [FK, Nullable]
+  + status: OrderStatus
+  + total: Int
+  + discountCode: String
+  + discountAmount: Int
+  + finalAmount: Int
+  + loyaltyPointsEarned: Int
+  + createdAt: DateTime
+  + updatedAt: DateTime
+  + calculateTotal(): Int
+  + canTransitionTo(nextStatus: OrderStatus): Boolean
+}
+
+class OrderItem {
+  + id: Int [PK]
+  + orderId: Int [FK]
+  + productId: Int [FK]
+  + productSizeId: Int [FK, Nullable]
+  + productName: String
+  + unitPrice: Int
+  + sizeName: String
+  + sizeSurcharge: Int
+  + qty: Int
+  + lineTotal: Int
+}
+
+class Payment {
+  + id: Int [PK]
+  + orderId: Int [FK]
+  + idempotencyKey: String
+  + amount: Int
+  + method: PaymentMethod
+  + status: PaymentStatus
+  + transactionId: String
+  + createdAt: DateTime
+}
+
+class Coupon {
+  + id: Int [PK]
+  + code: String
+  + type: DiscountType
+  + value: Int
+  + minOrderValue: Int
+  + maxDiscount: Int
+  + usageLimit: Int
+  + usedCount: Int
+  + startsAt: DateTime
+  + expiresAt: DateTime
+  + isActive: Boolean
+  + isValid(subtotal: Int): Boolean
+}
+
+class LoyaltyTransaction {
+  + id: Int [PK]
+  + userId: Int [FK]
+  + orderId: Int [FK]
+  + points: Int
+  + type: LoyaltyType
+  + createdAt: DateTime
+}
+
+' ================= RELATIONSHIPS =================
+User "1" --> "0..*" Order : places >
+User "1" --> "0..*" LoyaltyTransaction : owns >
+
+Order "1" *-- "1..*" OrderItem : contains >
+Product "1" <-- "0..*" OrderItem : references <
+
+Order "1" --> "0..*" Payment : settles with >
+Order "0..*" --> "0..1" Coupon : applies >
+Order "1" --> "0..1" LoyaltyTransaction : yields >
+
+' ================= ENUM ASSOCIATIONS =================
+User ..> Role
+Order ..> OrderStatus
+Payment ..> PaymentMethod
+Payment ..> PaymentStatus
+Coupon ..> DiscountType
+LoyaltyTransaction ..> LoyaltyType
+@enduml
+```
+---
+
+## 3. Đặc tả chi tiết các lớp thực thể (Entities)
+
+Theo yêu cầu mục 4.3 trong quy cách đề bài, mô hình bao quát đầy đủ 7 lớp thực thể miền trọng tâm:
+
+### 3.1. User (Người dùng)
+* **Mục đích:** Lưu trữ thông tin tài khoản, danh tính, số dư điểm tích lũy và phân quyền người dùng.
+* **Thuộc tính chính:**
+  * `id: Int [PK]`: Khóa chính định danh tự tăng.
+  * `email: String`: Địa chỉ email duy nhất dùng để đăng nhập.
+  * `passwordHash: String`: Mật khẩu đã băm bằng thuật toán bcrypt.
+  * `name: String`: Họ tên hiển thị của người dùng.
+  * `phone: String`: Số điện thoại nhận hàng (duy nhất).
+  * `loyaltyPoints: Int`: Tổng điểm tích lũy hiện tại của khách hàng.
+  * `role: Role`: Phân quyền người dùng (`CUSTOMER` hoặc `ADMIN`).
+  * `isActive: Boolean`: Trạng thái tài khoản (đang hoạt động hoặc bị khóa).
+
+### 3.2. Product (Sản phẩm đồ uống)
+* **Mục đích:** Quản lý thông tin đồ uống, giá niêm yết cơ bản và kiểm soát lượng hàng tồn kho.
+* **Thuộc tính chính:**
+  * `id: Int [PK]`: Khóa chính món đồ uống.
+  * `name: String`: Tên hiển thị trên menu (ví dụ: "Trà sữa Ô Long").
+  * `price: Int`: Đơn giá gốc (tính theo VNĐ, size chuẩn, chưa kèm topping).
+  * `stock: Int`: Số lượng phần còn lại có thể bán trong ngày.
+  * `version: Int`: Trường đánh dấu phiên bản dữ liệu phục vụ **Cơ chế khóa lạc quan (Optimistic Locking)** nhằm ngăn ngừa lỗi bán âm khi nhiều khách đặt cùng thời điểm (`NFR-05`).
+  * `isActive: Boolean`: Trạng thái kinh doanh sản phẩm.
+* **Phương thức:**
+  * `checkStock(qty: Int): Boolean`: Kiểm tra tồn kho có đủ đáp ứng số lượng yêu cầu.
+
+### 3.3. Order (Đơn hàng)
+* **Mục đích:** Quản lý toàn bộ tiến trình đặt món, giá trị thanh toán và trạng thái xử lý đơn.
+* **Thuộc tính chính:**
+  * `id: Int [PK]`: Khóa chính đơn hàng.
+  * `userId: Int [FK]`: Khóa ngoại tham chiếu người đặt hàng (`User`).
+  * `couponId: Int [FK, Nullable]`: Khóa ngoại liên kết mã giảm giá áp dụng (nếu có).
+  * `status: OrderStatus`: Trạng thái hiện tại của đơn hàng theo State Machine.
+  * `total: Int`: Tổng tiền gốc của các món trước giảm giá.
+  * `discountCode: String`: Mã giảm giá đã áp dụng tại thời điểm đặt đơn.
+  * `discountAmount: Int`: Số tiền được chiết khấu giảm trừ.
+  * `finalAmount: Int`: Số tiền thực tế khách cần chi trả (`total - discountAmount`).
+  * `loyaltyPointsEarned: Int`: Số điểm thưởng nhận được từ đơn hàng (10.000đ = 1 điểm).
+* **Phương thức:**
+  * `calculateTotal(): Int`: Tính toán tổng tiền đơn hàng.
+  * `canTransitionTo(nextStatus: OrderStatus): Boolean`: Xác thực tính hợp lệ của việc chuyển đổi trạng thái tiếp theo theo State Machine.
+
+### 3.4. OrderItem (Chi tiết món trong đơn)
+* **Mục đích:** Lưu trữ bản chụp (Snapshot) thông tin từng món tại thời điểm chốt đơn, bảo toàn dữ liệu lịch sử giá.
+* **Thuộc tính chính:**
+  * `id: Int [PK]`: Khóa chính dòng chi tiết.
+  * `orderId: Int [FK]`: Khóa ngoại liên kết với `Order`.
+  * `productId: Int [FK]`: Khóa ngoại trỏ đến món đồ uống gốc.
+  * `productName: String`: Tên món chụp lại tại thời điểm đặt.
+  * `unitPrice: Int`: Đơn giá món chụp lại tại thời điểm đặt.
+  * `sizeName: String`: Tên kích thước đã chọn (M, L).
+  * `sizeSurcharge: Int`: Phụ thu kích thước tại thời điểm đặt.
+  * `qty: Int`: Số lượng ly đặt.
+  * `lineTotal: Int`: Thành tiền của dòng chi tiết.
+
+### 3.5. Payment (Giao dịch thanh toán)
+* **Mục đích:** Lưu trữ nhật ký giao dịch thanh toán tài chính qua cổng thanh toán mô phỏng.
+* **Thuộc tính chính:**
+  * `id: Int [PK]`: Khóa chính giao dịch.
+  * `orderId: Int [FK]`: Khóa ngoại tham chiếu đơn hàng cần thanh toán.
+  * `idempotencyKey: String`: Khóa chống trùng lặp duy nhất (Unique Index), chặn trừ tiền hai lần khi client gửi lại request (`AC-06.7`, `NFR-05`).
+  * `amount: Int`: Số tiền thực tế thực hiện giao dịch (VNĐ).
+  * `method: PaymentMethod`: Phương thức (`WALLET` hoặc `CARD`).
+  * `status: PaymentStatus`: Trạng thái giao dịch (`SUCCESS` hoặc `FAILED`).
+  * `transactionId: String`: Mã tham chiếu giao dịch từ dịch vụ thanh toán.
+
+### 3.6. Coupon (Mã giảm giá / Promotion)
+* **Mục đích:** Quản lý chính sách khuyến mãi và giới hạn lượt sử dụng mã ưu đãi.
+* **Thuộc tính chính:**
+  * `id: Int [PK]`: Khóa chính mã giảm giá.
+  * `code: String`: Mã nhập ưu đãi (duy nhất, ví dụ: `BREWNEW`).
+  * `type: DiscountType`: Hình thức giảm (`PERCENT` hoặc `FIXED`).
+  * `value: Int`: Mức giảm (% hoặc số tiền VNĐ cố định).
+  * `minOrderValue: Int`: Giá trị đơn hàng tối thiểu để áp dụng mã.
+  * `maxDiscount: Int`: Mức giảm tối đa áp dụng cho loại giảm theo %.
+  * `usageLimit: Int`: Giới hạn tổng số lượt sử dụng toàn hệ thống.
+  * `usedCount: Int`: Số lượt đã sử dụng thực tế.
+  * `startsAt: DateTime`: Ngày bắt đầu hiệu lực.
+  * `expiresAt: DateTime`: Ngày hết hạn ưu đãi.
+  * `isActive: Boolean`: Cờ kích hoạt mã.
+* **Phương thức:**
+  * `isValid(subtotal: Int): Boolean`: Kiểm tra tính hợp lệ về thời gian, lượt dùng và giá trị đơn hàng.
+
+### 3.7. LoyaltyTransaction (Lịch sử tích điểm)
+* **Mục đích:** Theo dõi biến động cộng và hoàn trả điểm thưởng của khách hàng theo yêu cầu mục 4.3 trong PDF.
+* **Thuộc tính chính:**
+  * `id: Int [PK]`: Khóa chính giao dịch điểm.
+  * `userId: Int [FK]`: Khóa ngoại tham chiếu khách hàng.
+  * `orderId: Int [FK]`: Khóa ngoại tham chiếu đơn hàng phát sinh điểm.
+  * `points: Int`: Số điểm biến động.
+  * `type: LoyaltyType`: Phân loại biến động (`EARN`: cộng điểm khi thanh toán thành công; `REVERT`: thu hồi điểm khi đơn bị hủy - `AC-08.8`).
+
+---
+
+## 4. Các kiểu dữ liệu liệt kê (Enums)
+
+| Tên Enum | Danh sách giá trị | Mục đích nghiệp vụ |
+|---|---|---|
+| `Role` | `CUSTOMER`, `ADMIN` | Phân quyền vai trò người dùng và bảo vệ API Endpoints. |
+| `OrderStatus` | `PENDING`, `PAID`, `PREPARING`, `READY`, `COMPLETED`, `PAYMENT_FAILED`, `CANCELLED` | Kiểm soát vòng đời đơn hàng theo đúng State Machine. |
+| `PaymentMethod` | `WALLET`, `CARD` | Hai phương thức thanh toán mô phỏng được hỗ trợ. |
+| `PaymentStatus` | `SUCCESS`, `FAILED` | Kết quả xử lý thanh toán từ cổng mô phỏng. |
+| `DiscountType` | `PERCENT`, `FIXED` | Hình thức chiết khấu của phiếu giảm giá. |
+| `LoyaltyType` | `EARN`, `REVERT` | Phân loại biến động cộng hoặc trừ điểm thưởng. |
+
+---
+
+## 5. Đặc tả quan hệ và chỉ số bội số (Multiplicity)
+
+1. **`User` $\longleftrightarrow$ `Order` ($1 : 0..*$):**  
+   Một khách hàng có thể có 0 hoặc nhiều đơn hàng. Mỗi đơn hàng bắt buộc phải thuộc về đúng 1 người dùng đã đăng ký.
+2. **`Order` $\longleftrightarrow$ `OrderItem` ($1 : 1..*$, Quan hệ Composition):**  
+   Một đơn hàng bắt buộc phải có ít nhất 1 món chi tiết. Khi xóa `Order`, các `OrderItem` phụ thuộc sẽ bị xóa theo (Cascade Delete).
+3. **`Product` $\longleftrightarrow$ `OrderItem` ($1 : 0..*$):**  
+   Một món đồ uống có thể xuất hiện trong nhiều đơn hàng hoặc chưa từng được đặt.
+4. **`Order` $\longleftrightarrow$ `Payment` ($1 : 0..*$):**  
+   Một đơn hàng có thể có nhiều lượt thanh toán (lưu lại các lần thất bại trước khi thanh toán lại thành công).
+5. **`Order` $\longleftrightarrow$ `Coupon` ($0..* : 0..1$):**  
+   Mỗi đơn hàng chỉ được áp dụng tối đa 1 mã giảm giá. Một mã giảm giá có thể dùng cho nhiều đơn hàng khác nhau.
+6. **`User` $\longleftrightarrow$ `LoyaltyTransaction` ($1 : 0..*$):**  
+   Một người dùng sở hữu lịch sử gồm nhiều lần tích lũy hoặc điều chỉnh điểm thưởng.
+
+> **Quy tắc biên miền (Domain Boundary Rule):**  
+> Lớp `User` **không nối trực tiếp tới `Payment`**. Mọi giao dịch thanh toán đều là nghĩa vụ tài chính gắn với một đơn hàng cụ thể (`Order`). Do đó, `Payment` liên kết trực tiếp với `Order`, loại bỏ hoàn toàn liên kết vòng dư thừa (Redundant Association).
+
+---
+
+## 6. Tính nhất quán và khả năng truy vết (Traceability)
+
+* **Khớp mô hình dữ liệu (Prisma Schema):** Tên trường, quan hệ và kiểu dữ liệu `Int` (VNĐ) đồng bộ 100% với tệp `schema.prisma`.
+* **Khớp Sơ đồ tuần tự (Sequence Diagram):** Các trường `version` (khóa lạc quan), `idempotencyKey` (chống thanh toán trùng) và `OrderStatus` được sử dụng chính xác trong các kịch bản kiểm thử API Checkout và Payment.
+* **Thỏa mãn tiêu chuẩn nghiệm thu Task 2.3:** Đảm bảo đầy đủ 7 thực thể miền theo đúng quy định trang 4 trong hồ sơ Assignment 2.
+
+
+==================== FILE: docs\architecture\deployment.md ====================
+# BrewLite – Kiến trúc Triển khai, Bảo mật và Vận hành
+
+| Mục | Nội dung |
+|---|---|
+| Phạm vi | Task 3.2: kiến trúc triển khai, truy vết node về mã nguồn, nạp biến môi trường/secret, giám sát và rollback |
+| Phiên bản | 1.0 |
+| Nguồn sơ đồ (PlantUML) | [`../diagrams/deployment-diagram.puml`](../diagrams/deployment-diagram.puml) |
+| Ảnh kết xuất | `../diagrams/deployment-diagram.png` |
+| Tài liệu liên quan | [`c4-model.md`](c4-model.md) (mục 2, 4) |
+
+---
+
+## 1. Mục đích và phạm vi
+
+Tài liệu mô tả BrewLite được **đóng gói, triển khai, cấu hình, giám sát và khôi phục** như thế nào ở ba môi trường: Local, CI/CD và Production. Tài liệu kế thừa C2 trong `c4-model.md` (ba container Frontend, Backend, Database) và bổ sung lớp hạ tầng: reverse proxy, registry, pipeline, secret store, giám sát.
+
+Ngoài phạm vi: autoscaling, nhiều bản sao Backend, dashboard/cảnh báo, sao lưu và khôi phục thảm hoạ.
+
+## 2. Sơ đồ triển khai
+
+![Deployment Diagram](../diagrams/deployment-diagram.png)
+
+Sơ đồ chia thành 5 ranh giới:
+
+| Ranh giới | Nội dung | Ý nghĩa bảo mật |
+|---|---|---|
+| 1. Người dùng | Trình duyệt / PWA trên điện thoại hoặc máy tính | Không tin cậy; mọi dữ liệu vào đều được validate ở Backend |
+| 2. CI/CD (GitHub) | GitHub Actions, Container Registry | Giữ CI Secret và token đẩy image; không giữ dữ liệu người dùng |
+| 3. Local Dev | Docker Desktop chạy `docker-compose.yml` | Dữ liệu giả lập, secret chỉ có tác dụng trên máy dev |
+| 4. Production | Edge Gateway, mạng nội bộ (web, api, db), giám sát | Chỉ Edge Gateway mở ra Internet (HTTPS 443) |
+| – (trong 4) | Mạng nội bộ (Private Bridge Network) | `brewlite-web`, `brewlite-api`, `brewlite-db` không có cổng công khai |
+| 5. Dịch vụ bên ngoài | Mock Payment Gateway (HTTPS REST) | Hệ thống ngoài về mặt logic; API gọi sang kèm `Idempotency-Key` |
+
+Ghi chú khi đọc sơ đồ:
+
+1. **Mock Payment**  là hệ thống ngoài, đúng với góc nhìn logic của C1/C2. Khi hiện thực MVP, nó chạy như module `mock-payment` trong `apps/api` (cùng tiến trình).
+2. **Database** là container `brewlite-db` kèm volume `postgres_data`, đúng với Local và VPS. Nếu dùng Render, có thể dùng PostgreSQL do nền tảng quản lý; dù theo cách nào cũng **không mở cổng 5432 ra Internet**.
+3. **Liên kết 10 (giám sát)** biểu diễn quan hệ giữa API và hệ thống giám sát. Cơ chế vận hành: nền tảng chủ động gọi `GET /health` vào API, còn API ghi log JSON ra stdout để nền tảng thu thập (mục 7).
+
+## 3. Thuyết minh các node
+
+| Node | Stereotype | Công nghệ | Cổng | Vai trò |
+|---|---|---|---|---|
+| Smartphone / Desktop | `<<device>>` | Trình duyệt, PWA | – | Hiển thị UI, giữ giỏ hàng và JWT (`localStorage`) |
+| Edge Gateway | `<<Reverse Proxy / CDN>>` | Do nền tảng cung cấp | 443 | Kết thúc TLS, định tuyến UI về web và API về api |
+| `brewlite-web` | `<<container>>` | Next.js (App Router, SSR) | 3000 | Render menu phía server; gọi API qua `API_INTERNAL_URL` |
+| `brewlite-api` | `<<container>>` | NestJS (modular monolith) | 3001 | Nghiệp vụ, xác thực JWT, health check, log JSON |
+| `brewlite-db` | `<<container>>` | PostgreSQL 16, Prisma | 5432 | Lưu dữ liệu; chỉ API truy cập |
+| `postgres_data` | `<<Persistent Volume>>` | Docker volume | – | Dữ liệu còn nguyên khi container khởi động lại |
+| GitHub Actions | `<<CI Runner>>` | Workflow Lint → Test → Build | – | Kiểm tra, build image, triển khai |
+| Container Registry | `<<Container Registry>>` | Docker Hub hoặc GHCR | – | Lưu image `web` và `api`, gắn tag theo commit SHA |
+| Platform Health Probe & Log | `<<Monitoring & Logging>>` | Do nền tảng cung cấp | – | Gọi `GET /health`, thu thập log stdout |
+| Mock Payment Gateway | `<<External System>>` | HTTPS REST, JSON | – | Mô phỏng thanh toán Ví/Thẻ, nhận `Idempotency-Key` |
+
+Tài liệu này mô tả kiến trúc triển khai áp dụng chung cho cả hai nền tảng (Render và VPS).
+
+## 4. Bảng ánh xạ truy vết Node/Container về mã nguồn
+
+| Node / Container | Mã nguồn | Artifact | Biến môi trường |
+|---|---|---|---|
+| Developer Host (Docker Desktop) | [`docker-compose.yml`](../../docker-compose.yml), [`.env.example`](../../.env.example) | Ba service `web`, `api`, `db` | Toàn bộ biến ở mục 6.2 |
+| GitHub Actions pipeline | `.github/workflows/*.yml` | Workflow CI, CD | CI Secret (mục 6.3) |
+| Container Registry / Docker Images | `apps/web/Dockerfile`, `apps/api/Dockerfile` | Image `brewlite-web`, `brewlite-api` | `NEXT_PUBLIC_API_URL` truyền lúc build cho web |
+| Trình duyệt / PWA Client | [`apps/web`](../../apps/web) (manifest, service worker, trang App Router) | Bundle tĩnh, nằm trong image web | `NEXT_PUBLIC_API_URL` |
+| `brewlite-web` | [`apps/web`](../../apps/web) | Image web | `NODE_ENV`, `NEXT_PUBLIC_API_URL`, `API_INTERNAL_URL` |
+| `brewlite-api` | [`apps/api`](../../apps/api): `src/main.ts`, `src/health`, `src/common`, `src/payments` | Image api | `NODE_ENV`, `PORT`, `DATABASE_URL`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `CORS_ORIGIN`, `LOG_LEVEL`, `PAYMENT_*` |
+| Mock Payment Gateway | `apps/api/src/mock-payment` | Cùng image api | `PAYMENT_MOCK_ENABLED`, `PAYMENT_GATEWAY_URL`, `PAYMENT_TIMEOUT_MS` (và `WALLET_LIMIT`) |
+| `brewlite-db` / PostgreSQL 16 | `docker-compose.yml` (service `db`); schema, migration, seed ở `apps/api/prisma` | Image `postgres:16` | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` |
+| Persistent Volume `postgres_data` | `docker-compose.yml` (khối `volumes`) | Docker volume | – |
+| Edge Gateway | Không có mã nguồn; cấu hình trên nền tảng (TLS, route `/` và `/api/*`) | – | `CORS_ORIGIN` phải khớp domain công khai |
+| Platform Health Probe & Log | Không có mã nguồn; cấu hình đường dẫn probe trên nền tảng; phía API: `src/health`, `src/common` | – | `LOG_LEVEL` |
+
+Ánh xạ từng liên kết (số thứ tự theo sơ đồ):
+
+| # | Liên kết | Giao thức | Cấu hình / mã liên quan |
+|---|---|---|---|
+| 1 | Local → CI | Git push, pull request | Nhánh `feat/*`, `develop`, `main` (README) |
+| 2 | CI → Registry | Docker push | Workflow build; tag = commit SHA |
+| 3 | Registry → Production (sơ đồ vẽ tới Edge Gateway) | CD deploy image `web`, `api`; trước đó chạy `prisma migrate deploy` | Workflow CD, secret triển khai |
+| 4 | Người dùng → Edge | HTTPS 443, `Authorization: Bearer`, `Idempotency-Key` | TLS của nền tảng |
+| 5 | Edge → web | HTTP nội bộ, cổng 3000 | Route `/` |
+| 6 | Edge → api | HTTP nội bộ, cổng 3001 | Route `/api/*` |
+| 7 | web → api (SSR) | HTTP nội bộ | `API_INTERNAL_URL` |
+| 8 | api → db | Prisma qua TCP 5432 | `DATABASE_URL` |
+| 9 | db → volume | Ghi đĩa | Khối `volumes` |
+| 10 | api ↔ giám sát | Nền tảng gọi `GET /health`; API ghi log JSON ra stdout | `src/health`, `src/common` (logger), `LOG_LEVEL` |
+| 11 | api → Mock Payment | HTTPS REST (`POST /mock-pay`) | `PAYMENT_GATEWAY_URL`, `PAYMENT_TIMEOUT_MS` |
+
+## 5. Các môi trường triển khai
+
+| Thuộc tính | Local | CI | Production |
+|---|---|---|---|
+| Chạy bằng | `docker compose up` | GitHub Actions runner | Nền tảng (Render hoặc VPS) |
+| Ai dùng | Lập trình viên | Pipeline | Người dùng cuối, giảng viên chấm |
+| Cổng mở ra ngoài | 3000, 3001, 5432 (chỉ máy dev) | Không | Chỉ 443 qua Edge Gateway |
+| Database | Container + volume `postgres_data` | Service container tạm, bỏ sau mỗi lần chạy | PostgreSQL của nền tảng, hoặc container + volume trên VPS |
+| Migration | `prisma migrate dev`, `prisma db seed` | `prisma migrate deploy` lên DB test | `prisma migrate deploy` trước khi bật bản mới |
+| `LOG_LEVEL` | `debug` | `info` | `info` |
+| Nguồn cấu hình | `.env` | GitHub Actions Secrets | Biến môi trường / secret của nền tảng |
+
+Luồng thay đổi đi qua các môi trường:
+
+```
+Developer (feat/*) → Pull Request → [CI: Lint → Test → Build image]
+        → merge vào develop → (tuỳ chọn: môi trường kiểm thử)
+        → merge vào main → [CD: push image → migrate → deploy → smoke test] → Production
+```
+
+Quy ước: nhánh `main` là production (README); chỉ merge vào `main` mới kích hoạt CD.
+
+## 6. Nạp biến môi trường, Secrets và bảo vệ dữ liệu
+
+### 6.1 Nguyên tắc
+
+1. Cấu hình theo 12-factor: **mọi giá trị khác nhau giữa các môi trường nằm trong biến môi trường**, không nằm trong mã nguồn hay image.
+2. `@nestjs/config` nạp biến và **kiểm tra schema khi khởi động**. Thiếu hoặc sai biến bắt buộc thì API thoát với lỗi rõ ràng, nền tảng đánh dấu bản triển khai thất bại thay vì chạy với cấu hình sai (fail-fast).
+3. `.env.example` chỉ chứa **tên biến và giá trị mẫu vô hại**; `.env`, `.env.local`, `.env.production` nằm trong `.gitignore`.
+4. **Secret không được đóng vào image.** Image chỉ chứa mã; secret được truyền lúc chạy.
+5. Biến `NEXT_PUBLIC_*` bị nhúng vào bundle lúc build và ai cũng đọc được, nên **không bao giờ chứa secret**. Vì vậy đổi `NEXT_PUBLIC_API_URL` phải build lại image web.
+
+### 6.2 Danh mục biến và nơi nạp
+
+| Biến | Thành phần | Loại | Local | CI | Production |
+|---|---|---|---|---|---|
+| `NODE_ENV` | API, Web | Cấu hình | `.env` | Workflow (`test`/`production` theo job) | Biến của nền tảng |
+| `PORT` | API | Cấu hình | `.env` | – | Biến của nền tảng |
+| `DATABASE_URL` | API | **Secret** | `.env` (trỏ `db:5432`) | Giá trị DB test tạm, tạo trong workflow | Secret của nền tảng |
+| `JWT_SECRET` | API | **Secret** | `.env` (giá trị dev) | Giá trị ngẫu nhiên riêng cho test | Secret của nền tảng, tạo riêng cho production |
+| `JWT_EXPIRES_IN` | API | Cấu hình | `.env` | – | Biến của nền tảng |
+| `CORS_ORIGIN` | API | Cấu hình | `.env` (`http://localhost:3000`) | – | Domain công khai của web |
+| `LOG_LEVEL` | API | Cấu hình | `debug` | `info` | `info` |
+| `PAYMENT_GATEWAY_URL` | API | Cấu hình | `.env` (trỏ chính API) | Workflow | Biến của nền tảng |
+| `PAYMENT_MOCK_ENABLED` | API | Cấu hình | `true` | `true` | `true` trong MVP |
+| `PAYMENT_TIMEOUT_MS` | API | Cấu hình | `.env` | Workflow | Biến của nền tảng |
+| `NEXT_PUBLIC_API_URL` | Web | Cấu hình, **công khai** | `.env` | Build argument | Build argument lúc build image |
+| `API_INTERNAL_URL` | Web | Cấu hình | `.env` (`http://api:3001`) | – | Biến của nền tảng (địa chỉ nội bộ) |
+| `POSTGRES_USER`, `POSTGRES_DB` | Database | Cấu hình | `.env` | Workflow | Do nền tảng cấp |
+| `POSTGRES_PASSWORD` | Database | **Secret** | `.env` | Workflow | Do nền tảng cấp hoặc secret của VPS |
+
+Mô tả chi tiết từng biến xem [`c4-model.md`](c4-model.md) mục 4.3.
+
+### 6.3 Ba kênh nạp secret
+
+| Kênh | Lưu ở đâu | Ai đọc được | Cách đi vào ứng dụng | Rủi ro và cách giảm |
+|---|---|---|---|---|
+| **Local `.env`** | File trên máy dev, không commit | Chính lập trình viên | `docker-compose.yml` đọc `.env` rồi truyền vào container (`env_file` hoặc `environment`) | Lỡ commit: đã có `.gitignore`; dùng giá trị dev, không dùng chung với production |
+| **CI Secret** | GitHub Actions Secrets (cấp repository hoặc environment `production`) | Workflow được phép; giá trị bị che trong log | Workflow truyền qua `env:` hoặc `--build-arg` cho từng bước cần đến | Log lộ secret: GitHub tự che giá trị đã đăng ký, không `echo` biến; PR từ fork không nhận secret |
+| **Production Env** | Kho secret / Environment Variables của nền tảng | Người có quyền quản trị dự án trên nền tảng | Nền tảng tiêm vào container lúc khởi động | Lộ khi chia sẻ quyền: chỉ cấp cho người cần; xoay vòng khi nghi ngờ |
+
+Secret mà **pipeline CD** cần để triển khai (token đẩy image vào registry, khoá hoặc hook triển khai của nền tảng, `DATABASE_URL` để chạy migration) cũng lưu trong GitHub Actions Secrets của environment `production`. Tên cụ thể (ví dụ `REGISTRY_TOKEN`, `DEPLOY_HOOK_URL`) do nhóm đặt khi viết workflow.
+
+Quy tắc vận hành secret:
+
+- Giá trị production **khác hoàn toàn** giá trị local và CI; không dùng lại `JWT_SECRET`.
+- Nghi ngờ lộ `JWT_SECRET`: đổi giá trị trên nền tảng rồi triển khai lại. Mọi token đang lưu hành mất hiệu lực, người dùng đăng nhập lại (hệ quả của việc không có refresh token).
+- Nghi ngờ lộ `DATABASE_URL`: đổi mật khẩu người dùng DB trên nền tảng, cập nhật secret, triển khai lại.
+- Không dán secret vào issue, pull request, ảnh chụp màn hình hay tài liệu.
+
+### 6.4 Bảo vệ dữ liệu
+
+| Lớp | Biện pháp |
+|---|---|
+| Trên đường truyền | HTTPS tại Edge Gateway (TLS); lưu lượng web, api, db còn lại đi trong mạng nội bộ; lời gọi sang Mock Payment dùng HTTPS |
+| Truy cập dữ liệu | Chỉ `brewlite-api` kết nối DB; DB không mở cổng ra Internet; Frontend không truy cập DB |
+| Mật khẩu | Băm bằng bcrypt, lưu ở `passwordHash`, không ghi log |
+| Phiên đăng nhập | JWT ký bằng `JWT_SECRET`, thời hạn ngắn, kiểm tra `isActive`. Chi tiết xem [ADR-005](adr/005-jwt-authentication-rbac.md). |
+| Thanh toán | Không nhận, không lưu số thẻ hoặc CVV; chỉ nhận token mô phỏng; số tiền lấy từ `Order.finalAmount` ở server |
+| Nhật ký | Che `authorization`, mật khẩu, `passwordHash`, token thanh toán, `JWT_SECRET` |
+| Toàn vẹn dữ liệu | Transaction khi tạo đơn và thanh toán; ràng buộc `idempotencyKey` duy nhất. Chi tiết xem [ADR-006](adr/006-optimistic-locking-stock.md) và [ADR-007](adr/007-idempotent-payment.md). |
+| Lưu trữ bền | Volume `postgres_data` giữ dữ liệu khi container khởi động lại |
+| Mã nguồn | Secret ngoài repo; `.gitignore` chặn `.env*` |
+
+Rủi ro còn lại đã biết: JWT lưu ở `localStorage` có thể bị đánh cắp qua XSS; MVP chưa có quy trình sao lưu riêng.
+
+## 7. Giám sát và ghi log
+
+### 7.1 Health check
+
+| Endpoint | Loại | Kiểm tra | Phản hồi | Dùng cho |
+|---|---|---|---|---|
+| `GET /health` | Liveness | Tiến trình còn phản hồi, **không** gọi DB | `200 {"status":"ok"}` | Health check của nền tảng (quyết định khởi động lại); `healthcheck` của service `api` trong compose |
+| `GET /health/ready` | Readiness | Kết nối PostgreSQL (`SELECT 1`) | `200` khi sẵn sàng, `503` khi DB lỗi | Smoke test sau triển khai; chặn chuyển lưu lượng sang bản mới |
+
+Lý do tách đôi: nếu `/health` kiểm tra cả DB, khi DB lỗi nền tảng sẽ khởi động lại API liên tục mà không giải quyết được gì. Hai endpoint đều công khai, không yêu cầu JWT, và không trả thông tin nhạy cảm (không có chuỗi kết nối, phiên bản chi tiết).
+
+Mẫu `healthcheck` cho `docker-compose.yml` (mẫu tham khảo):
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  api:
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+```
+
+### 7.2 Ghi log
+
+| Nội dung | Giải pháp |
+|---|---|
+| Định dạng | JSON có cấu trúc, ghi ra stdout (ví dụ `nestjs-pino`); không ghi file trong container |
+| Truy vết | `requestId` lấy từ header `x-request-id` hoặc tự sinh, trả lại trong response; web chuyển tiếp header này khi gọi API để nối log hai phía |
+| Mức log | `LOG_LEVEL`: `debug` ở local, `info` ở production |
+| Xem log | Local: `docker compose logs -f api`; Production: trình xem log của nền tảng |
+| Sự kiện nghiệp vụ | Tạo đơn, kết quả thanh toán, xung đột tồn kho (409), đổi trạng thái đơn, lỗi 5xx |
+| Che dữ liệu nhạy cảm | Không ghi `authorization`, mật khẩu, `passwordHash`, token thanh toán, `JWT_SECRET` |
+| Tham chiếu | Chi tiết quyết định xem [ADR-010](adr/010-logging-health-config.md). |
+
+Cách điều tra một sự cố: lấy `requestId` từ response lỗi hoặc từ report của người dùng, lọc log API theo `requestId` để xem toàn bộ chuỗi xử lý của request đó, kể cả lần gọi `mock-payment`.
+
+Giới hạn: chưa có dashboard, cảnh báo tự động hay lưu log dài hạn; log mất khi nền tảng xoay vòng. Hiện tại việc phát hiện lỗi dựa vào health probe và việc đọc log thủ công.
+
+## 8. Quy trình triển khai và kiểm soát rollback
+
+### 8.1 Nguyên tắc
+
+1. **Image bất biến, gắn tag theo commit SHA.** Không triển khai bằng tag `latest`, để luôn biết chính xác đang chạy bản nào và quay lại được bản nào.
+2. **Migration tương thích ngược** (thêm trước, xoá sau). Nhờ đó rollback ứng dụng không cần rollback schema.
+3. **Chỉ coi là thành công khi smoke test qua.** Bản triển khai chưa qua smoke test chưa được ghi nhận là "bản tốt gần nhất".
+4. **Rollback ứng dụng là thao tác mặc định; rollback schema không làm tự động.**
+
+### 8.2 Các bước triển khai (CD, khi merge vào `main`)
+
+| Bước | Hành động | Điều kiện qua | Nếu thất bại |
+|---|---|---|---|
+| 1 | CI: Lint, Test (unit, integration), Build | Tất cả xanh | Dừng; không có gì được triển khai |
+| 2 | Build và push image `web`, `api` với tag = commit SHA | Push thành công | Dừng; production không đổi |
+| 3 | Ghi lại SHA của bản đang chạy (`PREV_SHA`) | Có giá trị | Dừng; không triển khai khi chưa biết bản để quay lại |
+| 4 | `prisma migrate deploy` lên DB production | Migration áp dụng xong | Dừng, **không** bật bản mới; xử lý theo mục 8.4 |
+| 5 | Triển khai image mới (api trước, web sau) | Nền tảng báo container chạy | Nền tảng giữ bản cũ nếu bản mới không qua health check; chuyển bước rollback |
+| 6 | Smoke test: `GET /health` và `GET /health/ready` trên domain production | Cả hai trả `200` (thử lại mỗi 5 giây, tối đa 12 lần) | Rollback tự động (mục 8.3) |
+| 7 | Kiểm tra nhanh luồng chính: `GET /products` trả `200` | Có dữ liệu menu | Rollback (mục 8.3) |
+| 8 | Đánh dấu SHA mới là bản tốt gần nhất | – | – |
+
+Các ngưỡng (5 giây, 12 lần, tức khoảng 60 giây) là giá trị đề xuất; chỉnh theo thời gian khởi động thực tế của API.
+
+### 8.3 Rollback ứng dụng
+
+Kích hoạt khi: smoke test bước 6 hoặc 7 thất bại; health check của nền tảng liên tục thất bại sau triển khai; hoặc tỉ lệ lỗi 5xx tăng đột biến trong log sau khi bản mới chạy.
+
+| Bước | Hành động |
+|---|---|
+| 1 | Dừng đưa thêm thay đổi vào `main` cho đến khi xử lý xong |
+| 2 | Triển khai lại image với tag `PREV_SHA` cho cả `api` và `web` (Render: chức năng Rollback / redeploy bản trước; VPS: `docker compose up -d` với tag cũ) |
+| 3 | Chạy lại smoke test của bước 6, 7 trên bản đã quay lại |
+| 4 | Xác nhận trong log: không còn lỗi 5xx liên tục, `requestId` mới xuất hiện bình thường |
+| 5 | Ghi lại sự cố: SHA lỗi, thời điểm, triệu chứng, nguyên nhân sơ bộ; tạo issue sửa lỗi trên nhánh `feat/*` |
+
+Vì migration luôn tương thích ngược, bản cũ chạy được trên schema mới. Nếu một migration **bắt buộc** phá vỡ tương thích (xoá cột, đổi kiểu), tách thành hai đợt phát hành: đợt đầu thêm cấu trúc mới và chuyển mã sang dùng nó; đợt sau, khi không còn bản cũ cần quay lại, mới xoá cấu trúc cũ.
+
+### 8.4 Khi migration lỗi (bước 4)
+
+`prisma migrate deploy` dừng và báo lỗi, bản mới **không** được bật nên người dùng vẫn dùng bản cũ trên schema hiện tại. Không có rollback tự động cho schema. Người phụ trách làm theo thứ tự:
+
+1. Đọc log để biết migration nào lỗi và đã áp dụng được đến đâu.
+2. Kiểm tra trạng thái thực tế của DB (bảng, cột đã tạo dở).
+3. Sửa tay phần dở dang nếu cần, rồi dùng `prisma migrate resolve` để đánh dấu migration đúng trạng thái (`--applied` hoặc `--rolled-back`).
+4. Sửa migration bằng một migration mới trên nhánh `feat/*`, không sửa migration đã áp dụng; sau đó chạy lại pipeline.
+
+Chỉ khôi phục DB từ bản sao lưu khi dữ liệu đã bị hỏng; MVP chưa có quy trình sao lưu riêng nên đây là rủi ro cần đánh giá.
+
+### 8.5 Bảng tình huống lỗi
+
+| Tình huống | Phát hiện bởi | Hành động | Ảnh hưởng người dùng |
+|---|---|---|---|
+| CI đỏ | GitHub Actions | Sửa trên nhánh, không merge | Không |
+| Thiếu biến bắt buộc | API thoát khi khởi động; health check không qua | Bổ sung biến trên nền tảng, triển khai lại; nếu cần, rollback | Không (bản cũ còn chạy) hoặc gián đoạn ngắn |
+| Migration lỗi | Bước 4 | Mục 8.4 | Không |
+| Bản mới chạy nhưng DB không kết nối được | `/health/ready` trả 503 | Kiểm tra `DATABASE_URL`, trạng thái DB; rollback nếu do bản mới | Có thể không đặt đơn được |
+| Lỗi nghiệp vụ lộ ra sau khi smoke test qua | Log 5xx, báo cáo người dùng | Rollback theo mục 8.3 | Có, cho đến khi rollback xong |
+| Cổng thanh toán quá thời gian (504) | Log, báo cáo | Không rollback: đây là hành vi thiết kế, đơn giữ `PENDING`, client gửi lại cùng `Idempotency-Key` | Khách thử lại |
+
+## 9. Lịch sử thay đổi
+
+| Phiên bản | Ngày | Nội dung / Lý do |
+|---|---|---|
+| 1.0 | 06/11/2026 | Khởi tạo: kiến trúc triển khai, truy vết node, nạp biến/secret, giám sát, rollback và phụ lục cấu hình. |
+
+---
+
+## Phụ lục A. Khung `.env.example` (chỉ tên biến, không giá trị thật)
+
+```dotenv
+# --- Chung ---
+NODE_ENV=development
+
+# --- API ---
+PORT=3001
+DATABASE_URL=postgresql://brewlite:change_me@db:5432/brewlite
+JWT_SECRET=change_me_dev_only
+JWT_EXPIRES_IN=15m
+CORS_ORIGIN=http://localhost:3000
+LOG_LEVEL=debug
+
+# --- Thanh toán mô phỏng ---
+PAYMENT_MOCK_ENABLED=true
+PAYMENT_GATEWAY_URL=http://localhost:3001/mock-payment
+PAYMENT_TIMEOUT_MS=5000
+
+# --- Web ---
+NEXT_PUBLIC_API_URL=http://localhost:3001
+API_INTERNAL_URL=http://api:3001
+
+# --- Database ---
+POSTGRES_USER=brewlite
+POSTGRES_PASSWORD=change_me
+POSTGRES_DB=brewlite
+```
+
+
+
+==================== FILE: docs\architecture\sequence-checkout.md ====================
+# Đặc tả Sơ đồ Tuần tự (Sequence Diagram) – Phân hệ Đặt hàng & Thanh toán BrewLite
+
+> **Tệp tài liệu:** `docs/architecture/sequence-checkout.md`  
+> **Tạo phẩm liên quan:** `docs/diagrams/sequence-checkout.puml`, `docs/diagrams/sequence-checkout.png`  
+> **Nhiệm vụ:** Task 2.2 – Sơ đồ tuần tự (Assignment 2)  
+> **Phạm vi use-case:** UC-05 (Đặt đơn hàng) & UC-07 (Thanh toán đơn hàng)[cite: 4, 5]  
+> **Đồng bộ:** Khớp 100% với `srs.md`[cite: 5], `context-and-scope.md`[cite: 6], `usecase-checkout.md`[cite: 4] và `class-diagram.md`.
+
+---
+
+## 1. Mục tiêu và phạm vi đặc tả
+
+Tài liệu này thuyết minh chi tiết tương tác động theo thời gian giữa các thành phần kiến trúc trong quy trình Checkout của BrewLite[cite: 4]. Sơ đồ tập trung giải quyết các bài toán kỹ thuật trọng yếu theo yêu cầu của đồ án:
+
+1. **Kiểm soát đồng thời và tồn kho (Concurrency Control):** Ngăn ngừa tình trạng bán âm tồn kho khi nhiều khách hàng cùng đặt một món sắp hết hàng thông qua cơ chế **Khóa lạc quan (Optimistic Locking)** với trường `version` (`AC-05.13`, `NFR-05`)[cite: 4, 5, 6].
+2. **Xử lý thanh toán an toàn lũy biến (Idempotency Enforcement):** Chặn việc trừ tiền và tạo giao dịch lặp khi người dùng bấm nút nhiều lần hoặc kết nối mạng chập chờn thông qua HTTP Header `Idempotency-Key` (`AC-06.7`, `NFR-05`)[cite: 4, 5, 6].
+3. **Đảm bảo tính toàn vẹn trạng thái (ACID Transaction & State Machine):** Quản lý chu trình chuyển đổi trạng thái của đơn hàng (`PENDING` $\rightarrow$ `PAID` / `PAYMENT_FAILED`) cùng bản ghi tích điểm `LoyaltyTransaction` trong một giao dịch cơ sở dữ liệu duy nhất[cite: 4, 5].
+
+---
+
+## 2. Sơ đồ tuần tự tương tác (Sequence Diagram)
+
+![Sơ đồ tuần tự Đặt hàng và Thanh toán](../diagrams/sequence-checkout.png)
+
+```plantuml
+@startuml sequence-checkout
+autonumber
+skinparam shadowing false
+skinparam roundcorner 4
+skinparam dpi 150
+skinparam defaultFontSize 11
+skinparam participantPadding 8
+skinparam boxPadding 6
+skinparam noteFontSize 10
+skinparam sequenceGroupFontSize 11
+
+skinparam sequence {
+  ArrowColor #1E293B
+  ActorBorderColor #1E293B
+  LifeLineBorderColor #64748B
+  LifeLineBackgroundColor #F8FAFC
+  ParticipantBorderColor #334155
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontStyle bold
+  GroupBorderColor #94A3B8
+  GroupBackgroundColor #F8FAFC
+}
+
+actor "Khách hàng" as User
+
+box "Client (PWA)" #F1F5F9
+  participant "Next.js App" as Client
+end box
+
+box "Backend API (NestJS)" #F8FAFC
+  participant "Order API\n& Guard" as OrderCtrl
+  participant "Payment API\n& Guard" as PayCtrl
+  participant "OrderService" as OrderSvc
+  participant "PaymentService" as PaySvc
+end box
+
+box "Storage & External" #F1F5F9
+  database "PostgreSQL\n(Prisma)" as DB
+  participant "Mock Gateway" as Gateway <<external>>
+end box
+
+== Giai đoạn 1: Đặt đơn & Khóa lạc quan (UC-05) ==
+
+User -> Client: Bấm "Đặt đơn" (+ Coupon)
+activate Client
+Client -> OrderCtrl: POST /api/orders [Bearer JWT]
+activate OrderCtrl
+OrderCtrl -> OrderSvc: createOrder(userId, dto)
+activate OrderSvc
+
+OrderSvc -> DB: [tx] Kiểm tra giá niêm yết & Coupon hợp lệ
+activate DB
+DB --> OrderSvc: Thông tin hợp lệ
+deactivate DB
+
+note over OrderSvc, DB
+  <b>Khóa lạc quan (Optimistic Locking):</b>
+  UPDATE "Product" SET stock = stock - qty, version = version + 1
+  WHERE id = pid AND version = curVer AND stock >= qty
+end note
+
+OrderSvc -> DB: [tx] Thực thi trừ kho có điều kiện version
+activate DB
+
+alt Xung đột tồn kho (Affected Rows == 0)
+  DB --> OrderSvc: 0 rows updated
+  OrderSvc --> OrderCtrl: ConflictException (409)
+  OrderCtrl --> Client: HTTP 409 Conflict
+  Client --> User: Báo "Món vừa hết hàng hoặc có người mua trước"
+else Cập nhật kho thành công (Affected Rows == 1)
+  DB --> OrderSvc: 1 row updated
+  OrderSvc -> DB: [tx] Tạo đơn hàng (status: 'PENDING')
+  activate DB
+  DB --> OrderSvc: Order #101 created
+  deactivate DB
+  OrderSvc --> OrderCtrl: OrderResponseDto (id: 101, status: PENDING)
+  deactivate OrderSvc
+  OrderCtrl --> Client: HTTP 201 Created (id: 101, finalAmount)
+  deactivate OrderCtrl
+  Client --> User: Chuyển màn hình chọn thanh toán
+end
+
+== Giai đoạn 2: Thanh toán an toàn lũy biến (UC-07) ==
+
+User -> Client: Chọn Ví/Thẻ & bấm "Thanh toán"
+Client -> Client: Sinh UUIDv4 (Idempotency-Key)
+Client -> PayCtrl: POST /api/payments\nHeader: Idempotency-Key
+activate PayCtrl
+PayCtrl -> PaySvc: processPayment(userId, orderId, key)
+activate PaySvc
+
+PaySvc -> DB: Kiểm tra Idempotency-Key trong bảng Payment
+activate DB
+DB --> PaySvc: Kết quả kiểm tra
+deactivate DB
+
+alt Khóa đã tồn tại (Bấm đúp / Gửi lặp do mạng chậm)
+  PaySvc --> PayCtrl: Trả về kết quả giao dịch ban đầu
+  PayCtrl --> Client: HTTP 200 OK (Cached Result)
+  Client --> User: Giữ nguyên trạng thái (chặn trừ tiền lần 2)
+else Khóa mới: Thực thi giao dịch
+  PaySvc -> Gateway: POST /mock-pay {amount, method}
+  activate Gateway
+
+  alt Cổng thanh toán từ chối (Hết số dư / Timeout)
+    Gateway --> PaySvc: {success: false, error}
+    PaySvc -> DB: [tx] Đơn -> PAYMENT_FAILED & lưu Payment FAILED
+    activate DB
+    DB --> PaySvc: Updated
+    deactivate DB
+    PaySvc --> PayCtrl: PaymentFailedException (402)
+    PayCtrl --> Client: HTTP 402 Payment Required
+    Client --> User: Báo lỗi & hiển thị nút "Thử lại thanh toán" (UC-08)
+  else Giao dịch thành công (Happy Path)
+    Gateway --> PaySvc: {success: true, transactionId}
+    deactivate Gateway
+    
+    note over PaySvc, DB
+      <b>ACID Transaction duy nhất:</b>
+      1. Tạo Payment (SUCCESS)
+      2. Chuyển Order -> PAID
+      3. Ghi LoyaltyTransaction (+1 điểm / 10k)
+      4. Tăng loyaltyPoints trên User
+    end note
+    
+    PaySvc -> DB: [tx] Ghi Payment, Order PAID, cộng điểm User
+    activate DB
+    DB --> PaySvc: Transaction committed
+    deactivate DB
+    
+    PaySvc --> PayCtrl: Success (status: PAID, txnId)
+    deactivate PaySvc
+    PayCtrl --> Client: HTTP 200 OK (status: PAID)
+    deactivate PayCtrl
+    Client -> Client: Dọn sạch giỏ hàng (LocalStorage)
+    Client --> User: Báo đặt hàng thành công & hiển thị điểm tích lũy
+    deactivate Client
+  end
+end
+
+@enduml
+```
+
+---
+
+## 3. Các thành phần tham gia (Lifeline Participants)
+
+| Tên Lifeline | Phân tầng kiến trúc | Công nghệ đảm nhiệm | Trách nhiệm chính trong kịch bản |
+|---|---|---|---|
+| **Khách hàng** | Actor | Người dùng cuối | Tương tác giao diện: đặt đơn, nhập mã giảm giá, chọn hình thức thanh toán và xác nhận giao dịch[cite: 4]. |
+| **Next.js App** | Client Layer (PWA) | Next.js, React, Tailwind CSS | Quản lý giỏ hàng cục bộ, sinh khóa `Idempotency-Key` (UUIDv4), gửi HTTP requests kèm Bearer JWT và xử lý điều hướng màn hình[cite: 6]. |
+| **Order API & Guard** | Presentation Layer | NestJS Controller, JWT AuthGuard | Xác thực danh tính người dùng (`userId`), kiểm tra tính hợp lệ của DTO đầu vào, điều hướng luồng xử lý xuống `OrderService`[cite: 4]. |
+| **Payment API & Guard** | Presentation Layer | NestJS Controller, JWT AuthGuard | Trích xuất header `Idempotency-Key`, xác thực người dùng và ủy quyền xử lý giao dịch thanh toán cho `PaymentService`. |
+| **OrderService** | Domain Service | NestJS Service, Prisma ORM | Tính toán tổng tiền từ giá niêm yết DB, thẩm định điều kiện áp dụng Coupon, thực thi giao dịch trừ kho với Khóa lạc quan[cite: 4]. |
+| **PaymentService** | Domain Service | NestJS Service, Prisma ORM | Kiểm tra an toàn lũy biến, gọi Mock Gateway, điều phối cập nhật trạng thái đơn hàng và tích lũy điểm thưởng theo giao dịch ACID[cite: 4]. |
+| **PostgreSQL (Prisma)** | Persistence Layer | PostgreSQL Database | Lưu trữ dữ liệu quan hệ, đảm bảo tính cô lập và toàn vẹn giao dịch (ACID transactions)[cite: 6]. |
+| **Mock Gateway** | External Service | RESTful Mock Service | Giả lập cổng thanh toán Ví/Thẻ, phản hồi mã giao dịch thành công hoặc lỗi từ chối giao dịch[cite: 5]. |
+
+---
+
+## 4. Thuyết minh chi tiết luồng xử lý
+
+### 4.1. Giai đoạn 1: Đặt đơn hàng & Khóa lạc quan (UC-05)
+
+1. **Khởi tạo đặt đơn:** Khách hàng bấm nút "Xác nhận đặt đơn" trên giỏ hàng[cite: 4]. Giao diện Next.js thu thập các mục giỏ hàng kèm mã giảm giá (`couponCode` nếu có) và gửi `POST /api/orders` với Bearer JWT Token.
+2. **Xác thực yêu cầu:** `Order API & Guard` kiểm tra tính hợp lệ của JWT. Nếu hợp lệ, trích xuất `userId` và gọi `OrderService.createOrder(userId, dto)`.
+3. **Thẩm định giá niêm yết và Coupon:**
+    - Hệ thống truy vấn trực tiếp bảng `Product` trong cơ sở dữ liệu để lấy đơn giá niêm yết, size, topping hiện hành, không dùng dữ liệu giá gửi từ phía client (`AC-05.2`)[cite: 4, 5].
+    - Thẩm định mã giảm giá: kiểm tra hạn sử dụng, số lượt dùng còn lại (`usedCount < usageLimit`) và giá trị đơn hàng tối thiểu (`minOrderValue`) (`AC-05.8` $\rightarrow$ `AC-05.11`)[cite: 4, 5].
+4. **Kiểm soát đồng thời bằng Khóa lạc quan (Optimistic Locking):**
+    - Đọc giá trị `version` hiện hành của từng sản phẩm trong giỏ.
+    - Thực thi lệnh cập nhật tồn kho có điều kiện phiên bản:
+      ```sql
+      UPDATE "Product"
+      SET stock = stock - :qty, version = version + 1
+      WHERE id = :productId AND version = :currentVersion AND stock >= :qty;
+      ```
+    - **Trường hợp xung đột (Conflict - Affected Rows == 0):** Do một khách hàng khác đã xác nhận mua trước làm tăng `version` hoặc tồn kho không đủ đáp ứng, lệnh update không tác động bản ghi nào[cite: 4]. `OrderService` ném `ConflictException (409)`. Client nhận mã `HTTP 409 Conflict` và hiển thị thông báo "Món vừa hết hàng hoặc có người mua trước" (`AC-05.13`, `NFR-05`)[cite: 4, 5].
+    - **Trường hợp thành công (Affected Rows == 1):** Tồn kho được khấu trừ an toàn. Hệ thống tăng `usedCount` của Coupon (nếu có) và khởi tạo bản ghi `Order` ở trạng thái **`PENDING`** (`AC-05.1`)[cite: 4].
+5. **Phản hồi:** Trả về `HTTP 201 Created` kèm `orderId` và `finalAmount`, client chuyển hướng khách hàng sang màn hình lựa chọn phương thức thanh toán.
+
+---
+
+### 4.2. Giai đoạn 2: Thanh toán an toàn lũy biến & Chuyển trạng thái (UC-07)
+
+1. **Khởi tạo thanh toán & Sinh khóa Idempotency:**
+    - Khách hàng chọn phương thức thanh toán (Ví hoặc Thẻ) và bấm "Xác nhận thanh toán"[cite: 4].
+    - Client tự động sinh chuỗi định danh ngẫu nhiên `UUIDv4` gắn vào Header `Idempotency-Key` và gửi `POST /api/payments`.
+2. **Kiểm tra an toàn lũy biến (Idempotency Check):**
+    - `PaymentService` tra cứu khóa trong bảng `Payment` theo `idempotencyKey`.
+    - **Trường hợp khóa đã tồn tại (Duplicate Request):** Xảy ra khi người dùng bấm đúp hoặc mạng chậm khiến request gửi lặp[cite: 5]. Hệ thống lập tức trả về kết quả giao dịch đã lưu trước đó kèm mã `HTTP 200 OK (Cached Result)`, chặn hoàn toàn việc trừ tiền lần hai (`AC-06.7`, `NFR-05`)[cite: 5].
+    - **Trường hợp khóa mới:** Hệ thống xác thực đơn hàng thuộc quyền sở hữu của `userId` và trạng thái hiện tại phải là `PENDING` hoặc `PAYMENT_FAILED`[cite: 4]. Sau đó, chuyển tiếp yêu cầu sang `Mock Gateway`.
+3. **Xử lý phản hồi từ Cổng thanh toán:**
+    - **Nhánh từ chối / Lỗi mạng (Gateway Failed):** Nếu tài khoản không đủ số dư hoặc quá thời gian chờ, hệ thống tạo bản ghi `Payment` với trạng thái `FAILED`, cập nhật trạng thái đơn hàng thành `PAYMENT_FAILED`[cite: 4]. API trả về `HTTP 402 Payment Required`. Client hiển thị thông báo lỗi bằng tiếng Việt kèm nút "Thử lại thanh toán" để kích hoạt use-case UC-08 (`AC-06.5`, `AC-06.6`)[cite: 4, 5].
+    - **Nhánh thanh toán thành công (Happy Path):** `Mock Gateway` phản hồi thành công kèm mã `transactionId`[cite: 4]. Hệ thống thực thi một giao dịch cơ sở dữ liệu duy nhất (`$transaction`) đảm bảo nguyên tử (Atomicity):
+        1. Khởi tạo bản ghi `Payment` với trạng thái `SUCCESS` và lưu `idempotencyKey`.
+        2. Cập nhật trạng thái `Order` từ `PENDING` sang **`PAID`** (`AC-06.1`)[cite: 4].
+        3. Khởi tạo bản ghi `LoyaltyTransaction` loại `EARN` ghi nhận điểm tích lũy theo quy tắc 10.000đ được 1 điểm (`AC-06.2`)[cite: 4, 5].
+        4. Tăng trường `loyaltyPoints` tương ứng trên bảng `User`.
+4. **Hoàn tất chu trình:** `Payment API` phản hồi `HTTP 200 OK`. Client dọn sạch dữ liệu giỏ hàng trên trình duyệt (`LocalStorage`), hiển thị màn hình xác nhận đặt hàng thành công kèm điểm thưởng vừa tích lũy (`AC-06.3`)[cite: 4, 5].
+
+---
+
+## 5. Quy tắc chuyển trạng thái đơn hàng (State Machine Mapping)
+
+```text
+        (Khởi tạo UC-05)
+               │
+               ▼
+           [ PENDING ] ◄────────────────────────┐
+               │                                │
+    (Thanh toán thành công)           (Khách bấm thử lại UC-08)
+               │                                │
+               ├──────────────────────┐         │
+               ▼                      ▼         │
+            [ PAID ]         [ PAYMENT_FAILED ] ┘
+               │                      │
+       (Admin tiếp nhận)       (Hết hạn chờ / Admin hủy)
+               │                      │
+               ▼                      ▼
+         [ PREPARING ]          [ CANCELLED ]
+```
+
+- **Tính bất biến của đơn đã thanh toán:** Khi đơn đã đạt trạng thái `PAID`, mọi nỗ lực thanh toán lại với đơn này đều bị chặn (`AC-06.8`)[cite: 4, 5].
+- **Cơ chế thanh toán lại (UC-08):** Đơn ở trạng thái `PAYMENT_FAILED` cho phép khách hàng tạo một yêu cầu thanh toán mới với `Idempotency-Key` mới từ trang "Đơn của tôi" (`AC-07.7`)[cite: 4, 5].
+
+---
+
+## 6. Ma trận truy vết yêu cầu (Traceability Matrix)
+
+| Kịch bản trên Sequence Diagram | Bước thực thi | Mã Yêu cầu SRS | Tiêu chí chấp nhận (AC) | Kết quả kiểm chứng |
+|---|:---:|---|---|---|
+| Khóa lạc quan khi trừ tồn kho | Bước 6 → 10 | FR-05, NFR-05[cite: 4] | AC-05.13, AC-N05.2[cite: 4] | Trả về `HTTP 409 Conflict` khi xảy ra tranh chấp dữ liệu đồng thời. |
+| Đặt đơn thành công | Bước 11 → 16 | FR-05[cite: 4] | AC-05.1, AC-05.3[cite: 4] | Đơn được tạo ở trạng thái `PENDING`, tồn kho bị trừ chính xác[cite: 4]. |
+| Chống trùng thanh toán lũy biến | Bước 21 → 25 | FR-06, NFR-05[cite: 4] | AC-06.7, AC-N05.3[cite: 4] | Trả về kết quả giao dịch đã lưu, không gọi cổng thanh toán lần 2. |
+| Thanh toán thất bại & Thử lại | Bước 26 → 32 | FR-06[cite: 4] | AC-06.5, AC-06.6, AC-07.7[cite: 4] | Đơn chuyển `PAYMENT_FAILED`, hiển thị lỗi tiếng Việt và cho phép thử lại[cite: 4]. |
+| Thanh toán thành công & Tích điểm | Bước 33 → 39 | FR-06[cite: 4] | AC-06.1, AC-06.2, AC-06.3[cite: 4] | Đơn chuyển `PAID`, xóa giỏ hàng, điểm thưởng được cộng vào tài khoản[cite: 4]. |
+
+
+==================== FILE: docs\architecture\adr\001-monorepo.md ====================
+# ADR-001: Dùng monorepo cho web, API, tài liệu và test
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+BrewLite gồm hai ứng dụng (Next.js và NestJS), tài liệu Task 1–3, bộ test tích hợp/E2E và cấu hình CI/CD. Đề bài yêu cầu cấu trúc `apps/web`, `apps/api`, `docs`. Nhóm nhỏ, thời gian hai sprint, cần truy vết từ yêu cầu đến code và test.
+
+## Quyết định
+
+Dùng **một repository** với cấu trúc:
+
+```
+brewlite/
+├── apps/web/            # Next.js
+├── apps/api/            # NestJS
+├── docs/                # tài liệu, sơ đồ, ADR
+├── tests/               # integration / E2E
+├── .github/workflows/   # CI/CD
+├── docker-compose.yml
+└── .env.example
+```
+
+Mỗi app có `package.json`, lockfile và `Dockerfile` riêng. MVP không dùng công cụ monorepo nặng (Nx, Turborepo).
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Nhiều repository (web, api, docs riêng) | Khó truy vết, một thay đổi xuyên web và API phải tách nhiều PR, giảng viên phải clone nhiều nơi |
+| Monorepo với Nx/Turborepo | Thêm độ phức tạp cấu hình mà MVP chưa cần |
+
+## Hệ quả
+
+**Ưu điểm**
+- Một pull request có thể sửa web, API và tài liệu cùng lúc; lịch sử thay đổi liền mạch.
+- Một nơi cho issue board, CI/CD và `docker-compose.yml`; người ngoài nhóm chỉ cần clone một lần.
+- Dễ giữ tài liệu và code đồng bộ, phù hợp ma trận truy vết.
+
+**Hạn chế / đánh đổi**
+- CI có thể chạy cả web lẫn API dù chỉ một bên thay đổi; cần job riêng và lọc theo đường dẫn nếu pipeline chậm.
+- Không tự động chia sẻ kiểu dữ liệu giữa web và API; hợp đồng API dựa vào tài liệu và test.
+- Lịch sử commit chung nên cần quy ước commit rõ (ví dụ `feat(api):`, `docs:`).
+
+## Liên quan
+
+Task 4.1 trong đề bài; `docs/architecture/c4-model.md` (mục 2).
+
+
+
+==================== FILE: docs\architecture\adr\002-nextjs-pwa-frontend.md ====================
+# ADR-002: Frontend Next.js mobile-first/PWA, giỏ hàng ở phía client
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Khách chủ yếu đặt đồ uống bằng điện thoại, cần tải nhanh và có thể thêm vào màn hình chính. Đề bài bắt buộc Next.js theo hướng mobile-first/PWA. Mô hình dữ liệu hiện tại không có bảng giỏ hàng; đơn chỉ được tạo khi khách bấm đặt.
+
+## Quyết định
+
+1. Dùng **Next.js** (App Router), thiết kế mobile-first, bổ sung PWA (web manifest, icon, service worker tối thiểu).
+2. Trang menu và chi tiết sản phẩm dùng **render phía server** (SSR) để tải nhanh; các thao tác tương tác (giỏ hàng, checkout) chạy phía trình duyệt.
+3. **Giỏ hàng lưu phía client** (state, có thể lưu lại bằng `localStorage` để không mất khi tải lại trang). Server chỉ nhận giỏ hàng khi `POST /orders`, và **tính lại toàn bộ giá phía server**, không tin giá từ client.
+4. Theo dõi trạng thái đơn bằng **polling** định kỳ trên trang chi tiết đơn.
+5. Frontend không truy cập cơ sở dữ liệu; chỉ gọi Backend qua REST (JSON/HTTPS, Bearer JWT).
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| SPA thuần (Vite + React) | Menu tải chậm hơn, thiếu SSR; đề đã chỉ định Next.js |
+| Giỏ hàng lưu trong DB (bảng Cart) | Thêm bảng, API và đồng bộ; không cần cho MVP |
+| WebSocket/SSE cho trạng thái đơn | Phức tạp hơn polling, khó triển khai trên gói hạ tầng miễn phí |
+
+## Hệ quả
+
+**Ưu điểm**
+- Menu hiển thị nhanh trên mạng di động; có thể cài đặt như ứng dụng.
+- Không phải xây thêm API và bảng cho giỏ hàng; Backend đơn giản hơn.
+- Giá luôn được kiểm tra lại ở server nên khách không thể sửa giá phía client.
+
+**Hạn chế / đánh đổi**
+- Giỏ hàng không đồng bộ giữa các thiết bị.
+- Polling tạo thêm request và có độ trễ vài giây khi đổi trạng thái đơn.
+- SSR gọi API từ container Frontend nên cần hai địa chỉ API: địa chỉ nội bộ cho SSR và địa chỉ công khai cho trình duyệt (xem ADR-010).
+- Service worker chỉ cache tài nguyên tĩnh; không hỗ trợ đặt đơn offline.
+
+## Liên quan
+
+FR về menu, giỏ hàng, theo dõi đơn (SRS); ràng buộc C1, C15 trong `context-and-scope.md`; `apps/web`.
+
+
+
+==================== FILE: docs\architecture\adr\003-nestjs-modular-layered-backend.md ====================
+# ADR-003: Backend NestJS theo modular monolith và kiến trúc phân lớp
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Backend cần xử lý nghiệp vụ đơn hàng, tồn kho, thanh toán, xác thực. Đề bài yêu cầu NestJS theo module/domain. Nhóm nhỏ, hai sprint, triển khai trên hạ tầng giới hạn.
+
+## Quyết định
+
+Xây dựng **một ứng dụng NestJS duy nhất (modular monolith)**, chia module theo domain, mỗi module phân lớp:
+
+```
+Controller (HTTP, DTO, validate)  →  Service (nghiệp vụ, transaction)  →  Prisma Client (truy cập dữ liệu)
+```
+
+| Module | Trách nhiệm |
+|---|---|
+| `AuthModule` | Đăng ký, đăng nhập, JWT, guard theo vai trò |
+| `UsersModule` | Hồ sơ người dùng |
+| `CatalogModule` | Sản phẩm, danh mục, size, topping |
+| `OrdersModule` | Tạo đơn, trừ kho, trạng thái đơn, lịch sử |
+| `PaymentsModule` | Thanh toán, idempotency, gọi `PaymentGateway` |
+| `CouponsModule`, `NotificationsModule` | Phạm vi mở rộng (Should/Could) |
+| `HealthModule` | `GET /health`, `GET /health/ready` |
+| `PrismaModule`, `Common` | Kết nối DB, cấu hình, logging, filter lỗi, pipe validate |
+
+Quy tắc:
+- Controller không chứa nghiệp vụ; Service không phụ thuộc `Request`/`Response`.
+- Validate đầu vào bằng DTO và `ValidationPipe` toàn cục (`whitelist`, `transform`).
+- Lỗi nghiệp vụ trả về mã HTTP và mã lỗi thống nhất qua exception filter.
+- Module chỉ gọi module khác qua Service được export, không truy cập bảng của module khác tuỳ tiện.
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Microservices (order, payment, catalog tách riêng) | Quá nặng cho MVP: nhiều deploy, giao dịch phân tán, chi phí hạ tầng |
+| Express thuần | Thiếu cấu trúc module, DI, guard/pipe có sẵn; đề đã chỉ định NestJS |
+
+## Hệ quả
+
+**Ưu điểm**
+- Một đơn vị triển khai, một transaction DB cho tạo đơn và trừ kho, không cần giao dịch phân tán.
+- Ranh giới module rõ ràng; dễ tách thành dịch vụ riêng sau này nếu cần.
+- Dễ unit test từng Service và integration test từng module.
+
+**Hạn chế / đánh đổi**
+- Mở rộng theo chiều ngang phải nhân bản cả ứng dụng, không scale riêng từng module.
+- Một lỗi nghiêm trọng có thể ảnh hưởng toàn bộ API.
+- Kỷ luật phân lớp phụ thuộc vào code review, framework không tự ép.
+
+## Liên quan
+
+Ràng buộc C2, C14; `apps/api`; ADR-004, 006, 007.
+
+
+
+==================== FILE: docs\architecture\adr\004-postgresql-prisma-migration.md ====================
+# ADR-004: PostgreSQL 16 và Prisma, quản lý schema bằng migration
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Đề bài bắt buộc PostgreSQL và yêu cầu migration/seed tái tạo được database. Dữ liệu có quan hệ chặt (đơn hàng, món, topping, thanh toán) và cần transaction. Nhóm cần công cụ truy cập dữ liệu có kiểu dữ liệu an toàn và kiểm thử được.
+
+## Quyết định
+
+1. Dùng **PostgreSQL 16**, chạy bằng Docker (volume lưu trữ bền) ở local; ở production dùng dịch vụ PostgreSQL của nền tảng, không mở ra Internet.
+2. Dùng **Prisma** làm ORM; `datasource` phải khai báo `provider = "postgresql"`.
+3. Quản lý schema bằng **Prisma Migrate**:
+   - Phát triển: `prisma migrate dev`.
+   - CI/CD và production: `prisma migrate deploy`, chạy **trước** khi khởi động phiên bản mới.
+   - Dữ liệu mẫu: `prisma db seed`, chạy được lặp lại.
+4. Tiền tệ lưu bằng **số nguyên VNĐ** (`Int`), không dùng số thực.
+5. Đơn hàng lưu **snapshot** tên, giá, size, topping tại thời điểm đặt (xem ADR-009).
+6. Migration theo hướng **tương thích ngược** (thêm trước, xoá sau) để rollback ứng dụng không phải rollback schema.
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| MySQL (schema khởi tạo ban đầu dùng provider này) | Đề bắt buộc PostgreSQL |
+| TypeORM | Kiểu dữ liệu và migration kém tiện hơn Prisma với nhóm hiện tại |
+| SQL thuần | Tốn thời gian viết và kiểm thử truy vấn, dễ sai |
+
+## Hệ quả
+
+**Ưu điểm**
+- Schema là một nguồn sự thật, migration có lịch sử trong Git; ai cũng tái tạo được database.
+- Kiểu dữ liệu sinh tự động giảm lỗi; `$transaction` hỗ trợ tạo đơn nhiều bước.
+- PostgreSQL hỗ trợ tốt transaction và ràng buộc unique dùng cho idempotency.
+
+**Hạn chế / đánh đổi**
+- Prisma bổ sung một bước sinh client (`prisma generate`) trong build và Dockerfile.
+- Truy vấn phức tạp có thể phải dùng `$queryRaw`.
+- Migration chạy khi triển khai phải xử lý cẩn thận để không khoá bảng lâu; quy trình chạy an toàn mô tả trong `docs/deployment.md`.
+- Đổi provider từ MySQL sang PostgreSQL yêu cầu tạo lại migration gốc (baseline).
+
+## Liên quan
+
+Ràng buộc C3, C4; `apps/api/prisma`; `docker-compose.yml`.
+
+
+
+==================== FILE: docs\architecture\adr\005-jwt-authentication-rbac.md ====================
+# ADR-005: Xác thực JWT (Bearer) và phân quyền theo vai trò
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Khách phải đăng nhập để đặt đơn và chỉ được xem đơn của mình; Admin quản lý đơn. Frontend (cổng 3000) và Backend (cổng 3001) chạy khác origin. Đề bài yêu cầu đăng ký, đăng nhập và JWT.
+
+## Quyết định
+
+1. Mật khẩu băm bằng **bcrypt** và lưu ở `passwordHash`; không bao giờ lưu hoặc ghi log mật khẩu gốc.
+2. Đăng nhập thành công trả về **JWT access token** có thời hạn ngắn, ký bằng bí mật `JWT_SECRET` lấy từ biến môi trường. Payload gồm `sub` (user id) và `role`.
+3. Client gửi `Authorization: Bearer <JWT>` trong mỗi request cần xác thực.
+4. Phân quyền bằng `JwtAuthGuard` và `RolesGuard` (`CUSTOMER`, `ADMIN`). Khách chỉ truy cập đơn có `userId` trùng `sub`; Admin được xem và cập nhật mọi đơn.
+5. Tài khoản `isActive = false` bị từ chối ở bước đăng nhập và khi xác thực.
+6. Endpoint xem menu (`GET /products`, `GET /products/:id`) công khai; tạo đơn, thanh toán, lịch sử đơn yêu cầu đăng nhập.
+7. MVP không có refresh token.
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Session + cookie | Frontend và API khác origin, cấu hình cookie cross-site và CSRF phức tạp hơn |
+| Token trong cookie httpOnly | An toàn hơn trước XSS nhưng cần xử lý CSRF và domain; để dành cho giai đoạn sau |
+| OAuth / đăng nhập mạng xã hội | Ngoài phạm vi MVP (O7) |
+
+## Hệ quả
+
+**Ưu điểm**
+- Stateless, API dễ mở rộng; không cần kho session.
+- Một cơ chế dùng được cho cả trình duyệt và test tự động.
+
+**Hạn chế / đánh đổi**
+- Không thu hồi được token trước khi hết hạn; giảm thiểu bằng thời hạn ngắn và kiểm tra `isActive`.
+- Token lưu phía client (MVP dùng `localStorage`) có rủi ro bị đánh cắp qua XSS; giảm thiểu bằng việc không chèn HTML thô, bật CSP cơ bản.
+- Không có refresh token nên khách phải đăng nhập lại khi token hết hạn.
+
+## Liên quan
+
+FR xác thực (SRS); NFR bảo mật; `apps/api` (`AuthModule`).
+
+
+
+==================== FILE: docs\architecture\adr\006-optimistic-locking-stock.md ====================
+# ADR-006: Khóa lạc quan (`version`) khi trừ tồn kho
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Nhiều khách có thể đặt cùng một món sắp hết hàng cùng lúc, hoặc Admin sửa tồn kho/giá khi đơn đang được tạo. Hệ thống không được bán vượt tồn kho. Bảng `Product` có sẵn cột `stock` và `version`.
+
+## Quyết định
+
+Trừ tồn kho **trong cùng transaction với việc tạo đơn**, bằng cập nhật có điều kiện theo `version`:
+
+```ts
+const result = await tx.product.updateMany({
+  where: { id: productId, version: seenVersion, stock: { gte: qty } },
+  data:  { stock: { decrement: qty }, version: { increment: 1 } },
+});
+// result.count === 0  → có xung đột hoặc hết hàng
+```
+
+Quy trình cho mỗi sản phẩm trong đơn:
+1. Gộp các dòng cùng `productId` thành một tổng số lượng.
+2. Đọc `stock` và `version` hiện tại trong transaction.
+3. Nếu `stock < qty` → từ chối với lỗi hết hàng (HTTP 409).
+4. Thực hiện `updateMany` như trên. Nếu `count = 0` → đọc lại và **thử lại tối đa 3 lần**; hết số lần thử thì trả HTTP 409 để khách thử lại.
+5. Chỉ khi mọi sản phẩm trừ kho thành công mới tạo `Order`, `OrderItem` và commit. Lỗi ở bất kỳ bước nào → rollback toàn bộ.
+
+Admin khi sửa sản phẩm cũng phải tăng `version`.
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Khóa bi quan (`SELECT ... FOR UPDATE`) | Giữ khoá hàng suốt transaction, dễ nghẽn và deadlock khi nhiều món; hạ tầng miễn phí có ít kết nối |
+| Chỉ dùng `stock >= qty` trong `UPDATE`, không có `version` | Đủ chống bán vượt tồn nhưng không phát hiện được xung đột với chỉnh sửa khác (giá, trạng thái) |
+| Không kiểm soát đồng thời | Bán vượt tồn kho, vi phạm mục tiêu G3 |
+
+## Hệ quả
+
+**Ưu điểm**
+- Không giữ khoá lâu; thông lượng tốt khi ít tranh chấp (trường hợp thường gặp của một cửa hàng).
+- Điều kiện `stock >= qty` nằm trong cùng câu lệnh nên kiểm tra và trừ là nguyên tử.
+- Kiểm thử được bằng integration test gửi nhiều đơn đồng thời.
+
+**Hạn chế / đánh đổi**
+- Với món rất hot, tranh chấp cao gây nhiều lần thử lại hoặc trả 409.
+- Frontend phải xử lý lỗi 409 (hết hàng hoặc thử lại) với thông báo rõ ràng.
+- Mọi đường ghi vào `Product` phải tuân thủ quy ước tăng `version`, nếu không cơ chế mất tác dụng.
+
+## Liên quan
+
+Ràng buộc C14; rủi ro R2; mục tiêu G3 trong `context-and-scope.md`; `apps/api` (`OrdersModule`); ADR-009.
+
+
+
+==================== FILE: docs\architecture\adr\007-idempotent-payment.md ====================
+# ADR-007: Thanh toán idempotent bằng `Idempotency-Key`
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Mạng di động chập chờn khiến client gửi lại yêu cầu thanh toán, hoặc người dùng bấm nhiều lần. Hệ thống không được ghi nhận hai khoản thanh toán cho một lần bấm. Bảng `Payment` có `idempotencyKey` duy nhất (`@unique`).
+
+## Quyết định
+
+1. Client sinh một **UUID v4** cho mỗi *lần người dùng bấm thanh toán* và gửi trong header `Idempotency-Key` của `POST /payments`. Gửi lại do mạng lỗi dùng **cùng key**; một lần bấm mới sau khi thất bại dùng **key mới**.
+2. Số tiền lấy từ `Order.finalAmount` ở server, không nhận từ client.
+3. Backend xử lý theo bảng sau:
+
+| Tình huống | Kết quả |
+|---|---|
+| Key mới, đơn chưa thanh toán | Gọi cổng thanh toán, ghi `Payment`, cập nhật đơn |
+| Key đã có, cùng `orderId` và `method` | Trả lại kết quả đã lưu (không gọi cổng lần nữa) |
+| Key đã có nhưng khác `orderId` hoặc `method` | HTTP 422 |
+| Đơn đã `PAID` (key mới) | HTTP 409 |
+| Hai request cùng key đến đồng thời | Ràng buộc unique chỉ cho một request ghi; request còn lại đọc và trả lại bản ghi đó |
+| Cổng thanh toán quá thời gian chờ (không rõ kết quả) | HTTP 504, không ghi `Payment`, đơn giữ `PENDING`; client gửi lại **cùng key** |
+
+4. Header `Idempotency-Key` được chuyển tiếp cho Mock Payment Service để cổng cũng chống trùng (lớp bảo vệ thứ hai).
+5. Khi thanh toán thành công, **một transaction** ghi `Payment(SUCCESS)` và chuyển đơn sang `PAID`. Khi thất bại, ghi `Payment(FAILED)` và chuyển đơn sang `PAYMENT_FAILED`, cho phép thử lại.
+6. Mã luôn đặt `status` của `Payment` một cách tường minh; không dựa vào giá trị mặc định của schema.
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Chỉ vô hiệu nút bấm ở frontend | Không chặn được request gửi lại do mạng hoặc gọi trực tiếp API |
+| Khoá theo `orderId` | Chặn luôn việc thử lại hợp lệ sau khi thất bại |
+| Hàng đợi/khoá phân tán (Redis) | Thêm hạ tầng, không cần cho MVP |
+
+## Hệ quả
+
+**Ưu điểm**
+- Gửi lại an toàn; kết quả cuối nhất quán dù client thử bao nhiêu lần.
+- Có thể kiểm thử bằng integration test gửi hai lần cùng key.
+
+**Hạn chế / đánh đổi**
+- Client phải sinh và giữ key đúng cách; sai quy ước sẽ gây thanh toán trùng hoặc không thử lại được.
+- Schema chưa có trạng thái `PENDING` cho `Payment`, nên bản ghi chỉ được ghi sau khi có kết quả; có khoảng thời gian ngắn giữa lúc gọi cổng và lúc ghi DB, được giảm thiểu nhờ cổng cũng chống trùng theo key.
+- Cần dọn hoặc giữ vô thời hạn các key cũ; MVP giữ lại toàn bộ.
+
+## Liên quan
+
+Mục tiêu G3, rủi ro R3; `apps/api` (`PaymentsModule`); ADR-008, 009.
+
+
+
+==================== FILE: docs\architecture\adr\008-mock-payment-service.md ====================
+# ADR-008: Mock Payment Service sau interface `PaymentGateway`
+
+| Trạng thái | Proposed (cần nhóm xác nhận cách hiện thực) |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Đề bài chỉ yêu cầu thanh toán Ví/Thẻ mô phỏng; tích hợp cổng thật nằm ngoài phạm vi (O1, O2). Sơ đồ C1/C2 vẽ Mock Payment Service là **hệ thống ngoài**, giao tiếp HTTPS/JSON và nhận `Idempotency-Key`. Cần thiết kế để sau này thay bằng cổng thật mà không sửa nghiệp vụ.
+
+## Quyết định
+
+1. Nghiệp vụ thanh toán chỉ phụ thuộc vào interface `PaymentGateway`:
+   ```ts
+   charge(input: { idempotencyKey; orderId; amount; method; token }):
+     Promise<{ status: 'SUCCESS' | 'FAILED'; transactionId?: string; reason?: string }>
+   ```
+2. Hiện thực `HttpPaymentGateway` gọi `POST {PAYMENT_GATEWAY_URL}/charges` (HTTPS, JSON) với header `Idempotency-Key`, thời gian chờ `PAYMENT_TIMEOUT_MS`.
+3. Trong MVP, **Mock Payment Service chạy dưới dạng module `mock-payment` bên trong `apps/api`** (tiền tố route `/mock-payment`, bật bằng `PAYMENT_MOCK_ENABLED`); `PAYMENT_GATEWAY_URL` trỏ tới chính API. Nhờ đó không cần thêm container nhưng luồng vẫn là một cuộc gọi HTTP thật, khớp với C2.
+4. Quy tắc mô phỏng (cấu hình được, mặc định):
+   - `CARD`: token `tok_success` → thành công; `tok_declined` → thất bại; `tok_timeout` → không phản hồi trong thời gian chờ.
+   - `WALLET`: thành công nếu số tiền không vượt hạn mức `WALLET_LIMIT`, ngược lại thất bại (không đủ số dư).
+5. **Không nhận, không lưu số thẻ, CVV hay dữ liệu thẻ thật**; client chỉ gửi token mô phỏng.
+6. Mock cũng áp dụng idempotency theo key (cùng key trả cùng kết quả).
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Gọi hàm trực tiếp trong tiến trình, không qua HTTP | Nhanh hơn nhưng C1/C2 phải sửa nhãn giao thức; khó thay bằng cổng thật |
+| Container riêng cho mock | Thêm một dịch vụ cần build, deploy và vẽ trong deployment diagram; chưa cần cho MVP |
+| Cổng sandbox thật (VNPay, Stripe…) | Ngoài phạm vi, rủi ro bảo mật và phụ thuộc bên ngoài |
+
+## Hệ quả
+
+**Ưu điểm**
+- Thay bằng cổng thật chỉ cần viết adapter mới cho `PaymentGateway`.
+- Kịch bản thành công, thất bại, quá thời gian đều kiểm thử được, kể cả E2E.
+
+**Hạn chế / đánh đổi**
+- Mock nằm cùng tiến trình với API nên khi triển khai, **deployment diagram phải ghi rõ** đây không phải container riêng; sơ đồ C1/C2 mô tả ranh giới logic.
+- API tự gọi chính mình qua HTTP, thêm một bước mạng trong cùng máy.
+- Nếu nhóm chọn gọi trực tiếp trong tiến trình hoặc tách container riêng, cần cập nhật ADR này, C2 và deployment diagram.
+
+## Liên quan
+
+Stakeholder S6, giả định A7, ngoài phạm vi O1, O2, O8; ADR-007; `apps/api`.
+
+
+
+==================== FILE: docs\architecture\adr\009-order-state-machine-and-snapshot.md ====================
+# ADR-009: Order State Machine, snapshot giá và giữ tồn kho
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Đơn hàng đi qua nhiều trạng thái, do cả khách (thanh toán) lẫn Admin (chế biến) tác động. Giá, size, topping có thể đổi sau khi đơn được tạo. Cần quy tắc chuyển trạng thái chặt chẽ và dữ liệu đơn không bị ảnh hưởng khi menu thay đổi.
+
+## Quyết định
+
+**1. Order State Machine.** Mọi chuyển trạng thái đi qua một hàm duy nhất trong `OrdersService`, chỉ cho phép các bước sau:
+
+| Từ | Sang | Do ai / sự kiện |
+|---|---|---|
+| `PENDING` | `PAID` | Thanh toán thành công |
+| `PENDING` | `PAYMENT_FAILED` | Thanh toán thất bại |
+| `PAYMENT_FAILED` | `PAID` | Thanh toán lại thành công |
+| `PENDING`, `PAYMENT_FAILED` | `CANCELLED` | Khách hoặc Admin huỷ |
+| `PAID` | `PREPARING` | Admin |
+| `PREPARING` | `READY` | Admin |
+| `READY` | `COMPLETED` | Admin |
+
+Mọi chuyển khác bị từ chối (HTTP 409). Huỷ đơn đã `PAID` không hỗ trợ trong MVP vì hoàn tiền nằm ngoài phạm vi (O8). Khi chuyển trạng thái, cập nhật có điều kiện theo trạng thái hiện tại để tránh hai Admin ghi đè nhau.
+
+**2. Snapshot.** Khi tạo đơn, `OrderItem` và `OrderItemTopping` lưu lại tên, đơn giá, size, phụ thu, topping và thành tiền tại thời điểm đặt. Đơn cũ không đổi khi giá hoặc menu thay đổi. `Order.total`, `discountAmount`, `finalAmount` do server tính.
+
+**3. Giữ tồn kho.** Tồn kho trừ khi tạo đơn (ADR-006). Đơn `PAYMENT_FAILED` **vẫn giữ chỗ** để khách thử lại. Khi đơn chuyển sang `CANCELLED`, **hoàn kho** trong cùng transaction.
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Trừ kho khi thanh toán thành công | Khách đã thanh toán có thể gặp hết hàng; mâu thuẫn với trải nghiệm đặt đơn |
+| Tham chiếu giá hiện tại của sản phẩm | Lịch sử đơn sai khi giá đổi |
+| Cho đổi trạng thái tự do | Dữ liệu không nhất quán, khó kiểm thử |
+
+## Hệ quả
+
+**Ưu điểm**
+- Trạng thái dự đoán được, test được từng bước chuyển; khớp activity diagram.
+- Lịch sử đơn và đối soát luôn đúng với thời điểm đặt.
+
+**Hạn chế / đánh đổi**
+- Đơn `PENDING`/`PAYMENT_FAILED` bị bỏ dở giữ tồn kho vô thời hạn. MVP xử lý bằng huỷ thủ công; tác vụ tự động huỷ đơn quá hạn là hướng mở rộng.
+- Snapshot làm tăng dung lượng lưu trữ và dữ liệu lặp.
+- Không huỷ được đơn đã thanh toán trong MVP.
+
+## Liên quan
+
+Enum `OrderStatus`; `OrderItem`, `OrderItemTopping`; giả định A6, A9; ADR-006, 007.
+
+
+
+==================== FILE: docs\architecture\adr\010-logging-health-config.md ====================
+# ADR-010: Logging JSON, health check và quản lý cấu hình
+
+| Trạng thái | Accepted |
+|---|---|
+| Ngày | 04/11/2026 |
+
+## Bối cảnh
+
+Hệ thống chạy ở ba môi trường (local, CI, production) và phải truy vết được sự cố, kiểm tra được sức khoẻ sau triển khai, và không để lộ secret. Đề bài yêu cầu logging, health check và quản lý cấu hình.
+
+## Quyết định
+
+**Logging**
+1. Backend dùng log **có cấu trúc dạng JSON ghi ra stdout** (ví dụ `nestjs-pino`). Không ghi ra file trong container.
+2. Mỗi request có `requestId` (nhận từ header `x-request-id` hoặc tự sinh, trả lại trong response) để nối log giữa Frontend, Backend.
+3. Mức log theo môi trường qua `LOG_LEVEL` (`debug` ở local, `info` ở production).
+4. Tập trung hoá nhờ nền tảng: `docker compose logs` ở local; trình xem log của nền tảng triển khai ở production. MVP không dựng ELK/Loki.
+5. **Che dữ liệu nhạy cảm**: không ghi `authorization`, mật khẩu, `passwordHash`, token thanh toán, `JWT_SECRET`.
+6. Ghi các sự kiện nghiệp vụ chính: tạo đơn, kết quả thanh toán, xung đột tồn kho, đổi trạng thái đơn, lỗi 5xx.
+
+**Health check**
+7. `GET /health` (liveness): trả 200 khi tiến trình sống, không phụ thuộc DB.
+8. `GET /health/ready` (readiness): kiểm tra kết nối PostgreSQL (`SELECT 1`, ví dụ bằng `@nestjs/terminus`); trả 503 khi DB không sẵn sàng.
+9. Dùng cho `healthcheck` trong `docker-compose.yml`, health check của nền tảng và smoke test sau khi triển khai.
+
+**Quản lý cấu hình**
+10. Cấu hình lấy từ **biến môi trường** (12-factor), nạp bằng `@nestjs/config` và **kiểm tra schema khi khởi động**; thiếu biến bắt buộc thì ứng dụng không chạy.
+11. `.env.example` liệt kê tên biến, **không chứa giá trị thật**; `.env` nằm trong `.gitignore`.
+12. Secret của CI và production lưu trong kho secret của GitHub Actions/nền tảng, không nằm trong repo hay log CI.
+13. Với Next.js, biến `NEXT_PUBLIC_*` được nhúng vào bundle lúc **build** nên không bao giờ chứa secret.
+
+## Phương án đã cân nhắc
+
+| Phương án | Lý do không chọn |
+|---|---|
+| Log dạng văn bản tự do, ghi file | Khó truy vấn, khó thu thập trong container |
+| ELK/Loki/Grafana | Chi phí và công cài đặt vượt phạm vi MVP |
+| Một endpoint `/health` duy nhất kiểm tra cả DB | Khi DB lỗi, nền tảng có thể khởi động lại liên tục cả ứng dụng không cần thiết |
+| File cấu hình trong repo | Dễ lộ secret, khó đổi theo môi trường |
+
+## Hệ quả
+
+**Ưu điểm**
+- Truy vết một request qua nhiều thành phần; log dễ lọc và phân tích.
+- Triển khai và smoke test tự động dựa vào health endpoint.
+- Cấu hình sai bị phát hiện ngay lúc khởi động thay vì lúc chạy.
+
+**Hạn chế / đánh đổi**
+- Không có dashboard, cảnh báo hay lưu log dài hạn; log mất khi nền tảng xoay vòng.
+- Log JSON khó đọc bằng mắt ở local nếu không dùng công cụ định dạng (ví dụ `pino-pretty`).
+- Đổi `NEXT_PUBLIC_API_URL` cần build lại image Frontend.
+
+## Liên quan
+
+NFR về khả năng triển khai và bảo mật; ràng buộc C10; `docs/deployment.md`; `.env.example`.
+
+
+
+==================== FILE: docs\architecture\adr\README.md ====================
+# Architecture Decision Records (ADR)
+
+Mỗi quyết định kiến trúc quan trọng của BrewLite được ghi thành một ADR ngắn trong thư mục này. ADR đã ở trạng thái *Accepted* không sửa nội dung; khi thay đổi quyết định, tạo ADR mới và đánh dấu ADR cũ là *Superseded by ADR-xxx*. Mọi thay đổi đi qua pull request và ghi rõ lý do.
+
+## Danh mục
+
+| ADR | Quyết định | Trạng thái |
+|---|---|---|
+| [001](001-monorepo.md) | Dùng monorepo cho web, API, tài liệu và test | Accepted |
+| [002](002-nextjs-pwa-frontend.md) | Frontend Next.js mobile-first/PWA, giỏ hàng ở phía client | Accepted |
+| [003](003-nestjs-modular-layered-backend.md) | Backend NestJS: modular monolith theo domain, phân lớp | Accepted |
+| [004](004-postgresql-prisma-migration.md) | PostgreSQL 16 + Prisma, quản lý schema bằng migration | Accepted |
+| [005](005-jwt-authentication-rbac.md) | Xác thực JWT (Bearer) và phân quyền theo vai trò | Accepted |
+| [006](006-optimistic-locking-stock.md) | Khóa lạc quan (`version`) khi trừ tồn kho | Accepted |
+| [007](007-idempotent-payment.md) | Thanh toán idempotent bằng `Idempotency-Key` | Accepted |
+| [008](008-mock-payment-service.md) | Mock Payment Service sau interface `PaymentGateway` | Proposed |
+| [009](009-order-state-machine-and-snapshot.md) | Order State Machine, snapshot giá, giữ tồn kho | Accepted |
+| [010](010-logging-health-config.md) | Logging JSON, health check, quản lý cấu hình | Accepted |
+
+ADR về nền tảng triển khai production (Render, Railway, Fly.io, VPS…) sẽ được thêm khi nhóm chốt nền tảng, cùng với deployment diagram.
+
+## Mẫu ADR
+
+```markdown
+# ADR-xxx: Tiêu đề quyết định
+
+| Trạng thái | Proposed / Accepted / Superseded by ADR-xxx |
+|---|---|
+| Ngày | dd/mm/yyyy |
+
+## Bối cảnh
+Vấn đề cần quyết định và các lực tác động (yêu cầu, ràng buộc).
+
+## Quyết định
+Nhóm chọn gì.
+
+## Phương án đã cân nhắc
+Các lựa chọn khác và lý do không chọn.
+
+## Hệ quả
+Ưu điểm, hạn chế và đánh đổi.
+
+## Liên quan
+Yêu cầu, tài liệu, mã nguồn.
+```
+
+
+
+==================== FILE: docs\requirements\context-and-scope.md ====================
+# BrewLite – Bối cảnh, Stakeholder và Phạm vi
+
+| Mục | Nội dung |
+|---|---|
+| Tài liệu | Task 1.1 – Bối cảnh, stakeholder và phạm vi |
+| Dự án | BrewLite – Assignment 2 (Requirements to Deployment) |
+| Phiên bản | 1.0 |
+| Trạng thái | Draft – chờ review qua pull request |
+| Liên quan | `srs.md` (Task 1.2), `usecase-checkout.md` (Task 1.3), `../traceability-matrix.md` |
+
+---
+
+## 1. Bối cảnh nghiệp vụ
+
+### 1.1 Lĩnh vực và vấn đề
+
+BrewLite hướng tới một cửa hàng đồ uống (cà phê, trà, trà sữa, nước ép) quy mô nhỏ đến vừa. Quy trình bán hàng truyền thống tại các cửa hàng này thường gặp các vấn đề sau:
+
+| # | Vấn đề hiện tại | Hệ quả |
+|---|---|---|
+| P1 | Khách phải xếp hàng tại quầy để xem menu và gọi món, đặc biệt vào giờ cao điểm | Thời gian chờ dài, khách bỏ đi, mất doanh thu |
+| P2 | Gọi món bằng lời dễ nhầm size, topping, mức đường/đá | Làm sai đơn, phải làm lại, lãng phí nguyên liệu |
+| P3 | Menu giấy/bảng cố định, khó cập nhật giá và tình trạng còn/hết hàng | Khách gọi món đã hết, nhân viên phải xin lỗi và đổi món |
+| P4 | Không có theo dõi trạng thái đơn, khách không biết khi nào món xong | Khách đứng chờ tại quầy, quầy đông và lộn xộn |
+| P5 | Tồn kho, khuyến mãi và lịch sử đơn được ghi thủ công | Sai lệch số liệu, khó đối soát, khó chăm sóc khách quen |
+
+### 1.2 Giải pháp đề xuất
+
+BrewLite là ứng dụng web **mobile-first/PWA** cho phép khách hàng tự xem menu, chọn size/topping, đặt đơn, thanh toán (mô phỏng) và theo dõi trạng thái đơn trên điện thoại. Phía cửa hàng có giao diện quản trị để tiếp nhận đơn và cập nhật trạng thái chế biến.
+
+Luồng nghiệp vụ tối thiểu:
+
+```
+Xem menu → Chọn tùy chọn → Giỏ hàng → Đặt đơn → Thanh toán → Theo dõi đơn
+```
+
+Vòng đời trạng thái đơn hàng (khớp với mô hình dữ liệu):
+
+```
+PENDING → PAID → PREPARING → READY → COMPLETED
+   │
+   ├──→ PAYMENT_FAILED  (thanh toán thất bại, cho phép thử lại)
+   └──→ CANCELLED       (đơn bị huỷ)
+```
+
+### 1.3 Mục tiêu hệ thống
+
+| Mã | Mục tiêu | Cách đo |
+|---|---|---|
+| G1 | Khách hoàn tất một đơn hàng từ menu đến xác nhận hoàn toàn trên điện thoại | Có E2E test cho luồng menu → xác nhận đơn |
+| G2 | Giảm sai sót khi gọi món nhờ lựa chọn size/topping có cấu trúc | Đơn hàng lưu snapshot tên, giá, size, topping tại thời điểm đặt |
+| G3 | Không bán quá số lượng tồn kho, không trừ tiền hai lần | Có test cho tạo đơn đồng thời và thanh toán lặp (idempotency) |
+| G4 | Khách và nhân viên cùng nhìn thấy trạng thái đơn mới nhất | Trạng thái đơn hiển thị đúng ở lịch sử đơn của khách và màn hình quản lý |
+| G5 | Hệ thống triển khai được, truy cập qua HTTPS và kiểm tra được sức khỏe | URL production, `GET /health`, pipeline CI/CD chạy thành công |
+
+---
+
+## 2. Stakeholder
+
+| # | Stakeholder | Vai trò / Mối quan hệ với hệ thống | Mục tiêu | Kỳ vọng |
+|---|---|---|---|---|
+| S1 | **Khách hàng** | Người dùng cuối, đặt và thanh toán đồ uống qua điện thoại | Gọi món nhanh, không phải xếp hàng; biết đơn của mình đang ở bước nào; tích điểm và dùng mã giảm giá | Giao diện đơn giản, dùng một tay, tải nhanh trên mạng di động; thông tin giá rõ ràng trước khi thanh toán; thanh toán lỗi không bị trừ tiền hai lần; xem lại được lịch sử đơn |
+| S2 | **Nhân viên quầy** | Tiếp nhận đơn đã thanh toán, pha chế, cập nhật trạng thái | Nhận đơn chính xác và đúng thứ tự; giảm hỏi lại khách; xử lý đơn nhanh trong giờ cao điểm | Danh sách đơn cập nhật kịp thời; thấy rõ size, topping, số lượng của từng món; đổi trạng thái đơn bằng ít thao tác |
+| S3 | **Quản lý cửa hàng** | Chủ/quản lý vận hành, chịu trách nhiệm menu, giá, tồn kho, doanh thu | Tăng doanh thu và tỉ lệ khách quay lại; kiểm soát tồn kho, giá và khuyến mãi; giảm sai sót vận hành | Quản lý được sản phẩm, giá, tồn kho; cảnh báo sắp hết/hết hàng; cấu hình mã giảm giá; dữ liệu đơn hàng đáng tin cậy để đối soát |
+| S4 | **Giảng viên / khách hàng nghiệm thu** | Người đánh giá sản phẩm và quy trình thực hiện của nhóm | Kiểm chứng nhóm làm đúng quy trình từ yêu cầu đến triển khai và sản phẩm chạy được | Tài liệu đầy đủ, truy vết được từ yêu cầu đến code và test; lịch sử commit/PR rõ ràng; URL production hoạt động; clone và chạy được theo README |
+| S5 | **Nhóm phát triển** | Phân tích, thiết kế, lập trình, kiểm thử, triển khai | Hoàn thành đúng hạn, đạt chất lượng, học và áp dụng quy trình CI/CD | Yêu cầu rõ ràng và ổn định trong phạm vi MVP; phạm vi vừa sức; công cụ và hạ tầng miễn phí hoặc chi phí thấp; có tiêu chí chấp nhận để viết test |
+| S6 | **Đơn vị thanh toán** (mô phỏng Ví/Thẻ) | Dịch vụ xử lý giao dịch; trong MVP là Payment Service giả lập | Nhận yêu cầu thanh toán hợp lệ, trả kết quả thành công/thất bại rõ ràng | Yêu cầu có mã idempotency để chống trùng; số tiền và phương thức hợp lệ; kết quả trả về nhất quán để hệ thống cập nhật trạng thái đơn |
+
+**Ma trận ảnh hưởng – quan tâm (tóm tắt)**
+
+| Mức quan tâm \ Ảnh hưởng | Cao | Thấp |
+|---|---|---|
+| **Cao** | S1 Khách hàng, S3 Quản lý, S4 Giảng viên, S5 Nhóm phát triển | S2 Nhân viên quầy |
+| **Thấp** | S6 Đơn vị thanh toán (vì là dịch vụ mô phỏng trong MVP) | — |
+
+---
+
+## 3. Phạm vi
+
+### 3.1 Trong phạm vi MVP (In-scope)
+
+| Nhóm | Chức năng | Ưu tiên |
+|---|---|---|
+| Menu | Xem danh sách sản phẩm theo danh mục (`GET /products`) với trạng thái loading, empty, error | Must |
+| Chi tiết sản phẩm | Xem chi tiết (`GET /products/:id`), chọn size (có phụ thu) và topping | Must |
+| Giỏ hàng | Thêm/sửa/xoá món, đổi số lượng, tính tổng tiền | Must |
+| Xác thực | Đăng ký, đăng nhập, phân quyền `CUSTOMER`/`ADMIN` bằng JWT | Must |
+| Đặt đơn | Tạo đơn trong một transaction, lưu snapshot giá/size/topping, kiểm tra và trừ tồn kho | Must |
+| Thanh toán | Thanh toán Ví/Thẻ mô phỏng, xử lý thành công/thất bại, thử lại thanh toán, chống trùng bằng idempotency key | Must |
+| Theo dõi đơn | Xem trạng thái đơn và lịch sử đơn của khách | Must |
+| Quản lý đơn | Admin/nhân viên xem đơn và cập nhật trạng thái `PAID → PREPARING → READY → COMPLETED` | Must |
+| Validate & lỗi | Validate dữ liệu ở cả frontend và backend; thông báo lỗi rõ ràng | Must |
+| Vận hành | `GET /health`, migration/seed tái tạo được, `docker-compose.yml` chạy web + API + DB | Must |
+| CI/CD | Pipeline Install → Lint → Test → Build; build image, push registry, deploy, smoke test | Must |
+
+### 3.2 Phạm vi mở rộng (làm nếu còn thời gian, đã có chỗ trong mô hình dữ liệu)
+
+| Chức năng | Ưu tiên | Ghi chú |
+|---|---|---|
+| Mã giảm giá (Coupon): theo phần trăm hoặc số tiền cố định, giá trị đơn tối thiểu, giới hạn lượt dùng, thời hạn | Should | Đơn lưu `discountCode`, `discountAmount`, `finalAmount` |
+| Tích điểm khách hàng (Loyalty Points) | Should | Lưu `loyaltyPointsEarned` trên đơn |
+| Thông báo cho Admin/Khách (đơn mới, đổi trạng thái, thanh toán thất bại, đơn huỷ) | Could | Thông báo trong ứng dụng, không gửi email/SMS |
+| Cảnh báo sắp hết hàng/hết hàng cho Admin | Could | Dựa trên `stock` của sản phẩm |
+| Admin quản lý sản phẩm, size, topping, danh mục (CRUD) | Should | Nếu chưa kịp, dùng dữ liệu seed |
+| Khả năng cài đặt PWA (manifest, icon, offline cơ bản cho menu) | Could | Ưu tiên giao diện mobile-first trước |
+| Huỷ đơn bởi khách khi đơn chưa vào chế biến | Could | Trạng thái `CANCELLED` |
+
+### 3.3 Ngoài phạm vi (Out-of-scope / Won't)
+
+| # | Nội dung không thực hiện | Lý do |
+|---|---|---|
+| O1 | Tích hợp cổng thanh toán thật (VNPay, MoMo, ZaloPay, Stripe…) | Đề bài chỉ yêu cầu thanh toán mô phỏng; tránh rủi ro bảo mật và pháp lý |
+| O2 | Lưu số thẻ thật hoặc dữ liệu thẻ nhạy cảm | Không cần cho mô phỏng; không đáp ứng yêu cầu tuân thủ thanh toán |
+| O3 | Giao hàng tận nơi, theo dõi shipper, tính phí vận chuyển | Chỉ phục vụ nhận món tại cửa hàng |
+| O4 | Hệ thống nhiều chi nhánh, nhiều cửa hàng | Vượt quá quy mô MVP |
+| O5 | Tích hợp máy POS, máy in hoá đơn/tem ly | Cần phần cứng |
+| O6 | Ứng dụng native iOS/Android | Đã chọn PWA bằng Next.js |
+| O7 | Đăng nhập bằng mạng xã hội, quên mật khẩu qua email/SMS, xác thực hai lớp | Không thuộc luồng cốt lõi |
+| O8 | Hoàn tiền tự động và đối soát với ngân hàng | Thanh toán chỉ mô phỏng |
+| O9 | Báo cáo doanh thu, thống kê nâng cao, dashboard phân tích | Không thuộc luồng end-to-end tối thiểu |
+| O10 | Đa ngôn ngữ, đa tiền tệ | Chỉ dùng tiếng Việt và VNĐ |
+| O11 | Đặt hẹn giờ lấy món, đặt bàn, gọi món theo bàn (QR tại bàn) | Có thể xem xét ở giai đoạn sau |
+| O12 | Quản lý nhân sự, ca làm, lương, công thức pha chế và nguyên liệu chi tiết | Không phải trọng tâm của hệ thống đặt đơn |
+
+---
+
+## 4. Giả định
+
+| Mã | Giả định | Ảnh hưởng nếu sai |
+|---|---|---|
+| A1 | Cửa hàng có một điểm bán duy nhất; khách nhận món trực tiếp tại quầy | Phải bổ sung chi nhánh/giao hàng, mở rộng mô hình dữ liệu |
+| A2 | Khách hàng có điện thoại và kết nối Internet, dùng trình duyệt hiện đại (Chrome, Safari bản mới) | Cần hỗ trợ trình duyệt cũ hoặc chế độ offline |
+| A3 | Khách phải đăng nhập mới được đặt đơn; xem menu thì không cần đăng nhập | Phải thiết kế luồng đặt đơn cho khách vãng lai |
+| A4 | Tiền tệ là VNĐ, lưu bằng số nguyên, không có số lẻ | Phải đổi kiểu dữ liệu và cách làm tròn |
+| A5 | Một đơn hàng thanh toán một lần; nếu thất bại, khách được thử lại trên cùng đơn (nhiều bản ghi `Payment` cho một đơn) | Phải thiết kế lại luồng thanh toán |
+| A6 | Tồn kho được trừ khi tạo đơn thành công, trong cùng transaction | Quy tắc hoàn kho khi huỷ đơn hoặc thanh toán thất bại phải được làm rõ trong SRS |
+| A7 | Dịch vụ thanh toán mô phỏng luôn phản hồi trong thời gian ngắn và có thể giả lập cả thành công lẫn thất bại | Cần thêm cơ chế timeout và xử lý giao dịch treo |
+| A8 | Nhân viên và quản lý dùng chung vai trò `ADMIN` trong MVP | Phải bổ sung vai trò riêng (ví dụ `STAFF`) và phân quyền chi tiết |
+| A9 | Giá, size, topping được quản lý bởi cửa hàng; đơn hàng luôn lưu snapshot nên thay đổi giá về sau không ảnh hưởng đơn cũ | Lịch sử đơn sẽ sai nếu tham chiếu trực tiếp đến giá hiện tại |
+| A10 | Dữ liệu mẫu (seed) đủ đại diện để kiểm thử và demo | Phải bổ sung dữ liệu để kiểm thử các trường hợp biên |
+
+---
+
+## 5. Ràng buộc
+
+### 5.1 Ràng buộc công nghệ (bắt buộc theo đề bài)
+
+| Mã | Ràng buộc |
+|---|---|
+| C1 | Frontend dùng **Next.js**, hướng mobile-first/PWA |
+| C2 | Backend dùng **NestJS**, tổ chức theo module/domain |
+| C3 | Cơ sở dữ liệu dùng **PostgreSQL**, có cơ chế migration và seed để tái tạo |
+| C4 | Đóng gói và chạy bằng **Docker**; `docker-compose.yml` chạy được web, API và database ở local |
+| C5 | Được bổ sung công nghệ khác (ORM, thư viện kiểm thử…) nhưng **không thay thế** ba thành phần Next.js, NestJS, PostgreSQL |
+
+### 5.2 Ràng buộc quy trình và bàn giao
+
+| Mã | Ràng buộc |
+|---|---|
+| C6 | Năm task thực hiện tuần tự; tạo phẩm của task trước phải có trên repository trước khi nghiệm thu task sau |
+| C7 | Toàn bộ tài liệu nằm trong `docs/`; mọi thay đổi yêu cầu, sơ đồ, kiến trúc đi qua commit/pull request và ghi rõ lý do |
+| C8 | Pull request chỉ được merge khi lint, test và build đều thành công |
+| C9 | Hệ thống phải có URL production truy cập qua HTTPS tại thời điểm chấm; nếu không, phần triển khai không được tính |
+| C10 | Secret không được xuất hiện trong repository hoặc log CI; database production không public trực tiếp |
+| C11 | Người ngoài nhóm clone repository và chạy theo README phải truy cập được hệ thống |
+
+### 5.3 Ràng buộc nguồn lực và kỹ thuật
+
+| Mã | Ràng buộc |
+|---|---|
+| C12 | Hai sprint trong một học kỳ, nhóm sinh viên; nguồn lực và thời gian có hạn nên phải ưu tiên theo MoSCoW |
+| C13 | Chi phí hạ tầng thấp hoặc miễn phí (gói free của Render, Railway, Fly.io hoặc tương đương); hiệu năng và dung lượng bị giới hạn theo gói |
+| C14 | Dữ liệu tiền, tồn kho phải nhất quán: tạo đơn và trừ kho trong một transaction, thanh toán có idempotency key, sản phẩm có khóa lạc quan (`version`) để tránh bán vượt tồn kho khi đặt đồng thời |
+| C15 | Giao diện thiết kế cho màn hình điện thoại trước, sau đó mới mở rộng cho màn hình lớn |
+
+---
+
+## 6. Rủi ro ban đầu
+
+| Mã | Rủi ro | Xác suất | Tác động | Biện pháp giảm thiểu |
+|---|---|---|---|---|
+| R1 | Phạm vi phình to (coupon, điểm thưởng, thông báo…) làm không kịp luồng cốt lõi | Cao | Cao | Chốt MVP theo MoSCoW; chỉ làm mục 3.2 sau khi luồng end-to-end chạy ổn |
+| R2 | Race condition khi nhiều khách đặt cùng món sắp hết hàng, dẫn đến bán vượt tồn kho | Trung bình | Cao | Transaction, khóa lạc quan theo `version`, integration test cho đặt đơn đồng thời |
+| R3 | Thanh toán bị gửi lặp do mạng chậm hoặc người dùng bấm nhiều lần | Cao | Cao | Idempotency key duy nhất cho mỗi lần thanh toán; test gửi lại cùng một yêu cầu |
+| R4 | Triển khai production thất bại hoặc nền tảng miễn phí giới hạn tài nguyên, ngủ đông | Trung bình | Cao | Chọn nền tảng sớm, triển khai thử từ Sprint 1; smoke test và hướng dẫn rollback |
+| R5 | Lộ secret (JWT secret, mật khẩu DB) trong repository hoặc log CI | Thấp | Cao | `.env.example` không chứa giá trị thật; dùng secret của CI/nền tảng; rà soát trước khi merge |
+| R6 | Yêu cầu, sơ đồ và mô hình dữ liệu mâu thuẫn nhau vì làm tuần tự | Trung bình | Trung bình | Duy trì ma trận truy vết; review chéo khi có thay đổi; mọi thay đổi qua pull request |
+| R7 | Thiếu thời gian cho kiểm thử, đặc biệt integration và E2E | Cao | Trung bình | Viết test song song với tính năng; xác định sớm kịch bản E2E tối thiểu |
+| R8 | Hiểu sai yêu cầu của stakeholder (ví dụ nhân viên cần thông tin gì khi pha chế) | Trung bình | Trung bình | Xác nhận yêu cầu qua use-case và tiêu chí chấp nhận; demo sớm cho giảng viên ở cuối Sprint 1 |
+| R9 | Thành viên nhóm chưa quen công nghệ (NestJS, Docker, CI/CD) | Trung bình | Trung bình | Phân công theo thế mạnh, làm việc cặp, ghi lại hướng dẫn trong README |
+| R10 | Lệch môi trường giữa local, CI và production (phiên bản Node, PostgreSQL) | Trung bình | Trung bình | Cố định phiên bản trong Dockerfile và CI; dùng cùng migration cho mọi môi trường |
+
+---
+
+## 7. Liên kết với các tạo phẩm khác
+
+| Nội dung | Tài liệu |
+|---|---|
+| Yêu cầu chức năng, phi chức năng, MoSCoW, tiêu chí chấp nhận | `docs/requirements/srs.md` (Task 1.2) |
+| Đặc tả use-case "Đặt và thanh toán đơn hàng" | `docs/requirements/usecase-checkout.md` (Task 1.3) |
+| Sơ đồ activity, sequence, class | `docs/diagrams/` (Task 2) |
+| Kiến trúc và ADR | `docs/architecture/` (Task 3) |
+| Truy vết | `docs/traceability-matrix.md` |
+
+---
+
+## 8. Lịch sử thay đổi
+
+| Phiên bản | Ngày | Người thực hiện | Nội dung / Lý do |
+|---|---|---|---|
+| 1.0 | 02/11/2026 | Nhóm BrewLite | Khởi tạo tài liệu bối cảnh và phạm vi |
+
+
+
+==================== FILE: docs\requirements\srs.md ====================
+# Đặc tả yêu cầu phần mềm (SRS) – BrewLite
+
+> Tệp: `docs/requirements/srs.md`
+> Phiên bản: 1.0 (bản đầu tiên) | Phạm vi: MVP
+
+## 1. Giới thiệu
+
+### 1.1 Mục đích tài liệu
+
+Tài liệu mô tả BrewLite cần làm gì từ góc nhìn nghiệp vụ: ai sử dụng, sử dụng để làm gì, quy trình diễn ra thế nào và khi nào một tính năng được xem là đạt yêu cầu. Tài liệu là cơ sở để nhóm phát triển, người kiểm thử và bên nghiệm thu cùng hiểu một nội dung.
+
+### 1.2 Bối cảnh nghiệp vụ
+
+BrewLite là hệ thống đặt đồ uống trực tuyến cho một cửa hàng trà và cà phê. Khách hàng chọn đồ uống ngay trên điện thoại thay vì xếp hàng gọi tại quầy; cửa hàng nhận đơn đã được thanh toán và chuẩn bị theo thứ tự. Khách nhận đồ uống tại quầy, hệ thống không phục vụ giao hàng.
+
+### 1.3 Quy trình nghiệp vụ tổng quát
+
+`Xem menu → Chọn tùy chọn → Giỏ hàng → Đặt đơn → Thanh toán → Theo dõi đơn`
+
+### 1.4 Người dùng
+
+| Người dùng | Vai trò trong nghiệp vụ |
+|---|---|
+| Khách hàng | Xem thực đơn, chọn đồ uống, đặt đơn, thanh toán và theo dõi đơn của mình |
+| Quản trị viên | Nhận và xử lý đơn, quản lý thực đơn và mã giảm giá, theo dõi hoạt động kinh doanh |
+| Dịch vụ thanh toán | Bên xử lý giao dịch Ví/Thẻ và trả về kết quả thành công hoặc thất bại. Giai đoạn đầu dùng bản mô phỏng |
+
+### 1.5 Quy ước trình bày
+
+- **MoSCoW:** Must (bắt buộc phải có), Should (nên có), Could (có thể có nếu còn thời gian), Won't (không làm trong giai đoạn này).
+- **Mã định danh:** FR-xx cho yêu cầu chức năng, NFR-xx cho yêu cầu phi chức năng, AC-xx.y cho tiêu chí chấp nhận thứ y của yêu cầu xx.
+- **Tiêu chí chấp nhận (AC):** viết theo dạng Given (bối cảnh) – When (hành động) – Then (kết quả mong đợi) để có thể kiểm chứng bằng cách thực hiện lại kịch bản.
+
+## 2. Bảng yêu cầu chức năng
+
+| Mã | Tên tính năng | Mô tả ngắn | Người dùng | MoSCoW |
+|---|---|---|---|---|
+| FR-01 | Xem thực đơn | Xem danh sách đồ uống đang bán, tìm kiếm và lọc theo nhóm | Khách hàng | Must |
+| FR-02 | Xem chi tiết và chọn tùy chọn | Xem chi tiết đồ uống, chọn size, topping và số lượng | Khách hàng | Must |
+| FR-03 | Giỏ hàng | Gom các món đã chọn, chỉnh sửa và xem tổng tiền | Khách hàng | Must |
+| FR-04 | Đăng ký và đăng nhập | Tạo tài khoản, đăng nhập, quản lý thông tin cá nhân | Khách hàng, Quản trị viên | Must |
+| FR-05 | Đặt đơn | Chuyển giỏ hàng thành đơn, áp dụng mã giảm giá | Khách hàng | Must |
+| FR-06 | Thanh toán | Thanh toán đơn bằng Ví hoặc Thẻ, tích điểm | Khách hàng | Must |
+| FR-07 | Lịch sử và theo dõi đơn | Xem xác nhận, trạng thái và lịch sử đơn của mình | Khách hàng | Must |
+| FR-08 | Quản lý đơn hàng | Xem danh sách đơn, cập nhật tiến độ, hủy đơn | Quản trị viên | Must |
+
+## 3. Trạng thái đơn hàng
+
+| Trạng thái | Ý nghĩa | Có thể chuyển sang |
+|---|---|---|
+| Chờ thanh toán | Đơn vừa được tạo, khách chưa thanh toán | Đã thanh toán, Thanh toán thất bại, Đã hủy |
+| Thanh toán thất bại | Lần thanh toán gần nhất không thành công | Chờ thanh toán (để thử lại), Đã hủy |
+| Đã thanh toán | Cửa hàng đã nhận tiền, chờ pha chế | Đang pha chế, Đã hủy |
+| Đang pha chế | Cửa hàng đang chuẩn bị đồ uống | Sẵn sàng |
+| Sẵn sàng | Đồ uống đã xong, chờ khách nhận | Hoàn tất |
+| Hoàn tất | Khách đã nhận đồ uống | Không chuyển tiếp |
+| Đã hủy | Đơn bị hủy | Không chuyển tiếp |
+
+Luồng bình thường: Chờ thanh toán → Đã thanh toán → Đang pha chế → Sẵn sàng → Hoàn tất.
+
+## 4. Đặc tả chức năng
+
+### FR-01 – Xem thực đơn
+
+**Mô tả.** Giúp khách hàng nhanh chóng biết cửa hàng đang bán gì, giá bao nhiêu và món nào còn hàng. Người dùng: khách hàng, kể cả khi chưa đăng nhập.
+
+**Các bước thực hiện**
+1. Khách mở trang thực đơn.
+2. Khách xem danh sách đồ uống kèm hình ảnh, tên và giá.
+3. Khách chọn một nhóm đồ uống (ví dụ trà sữa, cà phê, trà trái cây) hoặc nhập từ khóa để tìm món.
+4. Khách chọn một món để xem chi tiết.
+
+**Tiêu chí chấp nhận**
+- AC-01.1: Given cửa hàng có đồ uống đang bán, When khách mở trang thực đơn, Then khách thấy danh sách đồ uống, mỗi món có hình ảnh, tên và giá.
+- AC-01.2: Given một đồ uống đã được cửa hàng ngừng bán, When khách xem thực đơn, Then đồ uống đó không xuất hiện.
+- AC-01.3: Given khách chọn một nhóm đồ uống, When danh sách được cập nhật, Then chỉ các món thuộc nhóm đó được hiển thị.
+- AC-01.4: Given khách nhập một phần tên món (có dấu hoặc không dấu), When tìm kiếm, Then danh sách chỉ còn các món có tên phù hợp.
+- AC-01.5: Given không có món nào khớp với nhóm hoặc từ khóa đã chọn, When xem kết quả, Then khách thấy thông báo không có đồ uống phù hợp và gợi ý đổi nhóm hoặc từ khóa.
+- AC-01.6: Given dữ liệu thực đơn đang được tải, When khách chờ, Then khách thấy dấu hiệu đang tải thay vì màn hình trống.
+- AC-01.7: Given không tải được thực đơn, When màn hình hiển thị, Then khách thấy thông báo lỗi và nút "Tải lại"; khi bấm nút, hệ thống thử tải lại thực đơn.
+- AC-01.8: Given một món đã hết hàng, When khách xem thực đơn, Then món đó được gắn nhãn "Hết hàng" và khách không thể thêm món vào giỏ.
+
+### FR-02 – Xem chi tiết và chọn tùy chọn
+
+**Mô tả.** Cho phép khách xem thông tin đầy đủ của đồ uống và tùy chỉnh theo khẩu vị trước khi thêm vào giỏ. Người dùng: khách hàng.
+
+**Các bước thực hiện**
+1. Khách mở trang chi tiết của một đồ uống.
+2. Khách xem mô tả, giá và số lượng còn lại (nếu sắp hết).
+3. Khách chọn size.
+4. Khách chọn các topping phù hợp với món (nếu có).
+5. Khách chọn số lượng.
+6. Khách bấm "Thêm vào giỏ".
+
+**Tiêu chí chấp nhận**
+- AC-02.1: Given khách chọn một món đang bán, When mở trang chi tiết, Then khách thấy hình ảnh, tên, mô tả, giá và các size đang được phục vụ.
+- AC-02.2: Given món thuộc nhóm có topping, When khách xem chi tiết, Then khách thấy danh sách topping đang phục vụ của nhóm đó và có thể chọn nhiều topping.
+- AC-02.3: Given món thuộc nhóm không có topping (ví dụ cà phê), When khách xem chi tiết, Then khách không thấy lựa chọn topping.
+- AC-02.4: Given món giá 40.000đ, size L phụ thu 6.000đ, một topping giá 5.000đ, When khách chọn size L và topping đó, Then giá một ly hiển thị là 51.000đ và tổng tiền thay đổi theo số lượng đã chọn.
+- AC-02.5: Given món còn N phần, When khách chọn số lượng, Then khách chỉ chọn được từ 1 đến N phần.
+- AC-02.6: Given món chỉ còn từ 1 đến 5 phần, When khách xem chi tiết, Then khách thấy thông báo "Chỉ còn X phần".
+- AC-02.7: Given món đã hết hàng, When khách xem chi tiết, Then nút thêm vào giỏ không dùng được và có ghi "Hết hàng".
+- AC-02.8: Given khách mở một món không tồn tại hoặc đã ngừng bán, When trang hiển thị, Then khách thấy thông báo không tìm thấy món.
+- AC-02.9: Given khách chọn xong tùy chọn, When bấm "Thêm vào giỏ", Then khách nhận thông báo đã thêm và có lối đi nhanh tới giỏ hàng.
+
+### FR-03 – Giỏ hàng
+
+**Mô tả.** Giúp khách gom nhiều món, kiểm tra lại lựa chọn và biết tổng tiền trước khi đặt. Người dùng: khách hàng.
+
+**Các bước thực hiện**
+1. Khách mở giỏ hàng.
+2. Khách kiểm tra từng dòng: tên món, size, topping, số lượng, thành tiền.
+3. Khách tăng, giảm số lượng, đổi size hoặc topping, hoặc xóa món.
+4. Khách xem tổng tiền.
+5. Khách bấm "Thanh toán" để tiếp tục đặt đơn.
+
+**Tiêu chí chấp nhận**
+- AC-03.1: Given giỏ hàng trống, When khách thêm một món, Then giỏ hiển thị một dòng với tên món, size, topping, số lượng và thành tiền.
+- AC-03.2: Given giỏ đã có một món, When khách thêm lại cùng món với cùng size và cùng topping, Then số lượng của dòng đó tăng lên thay vì tạo dòng mới.
+- AC-03.3: Given giỏ có 2 ly giá 40.000đ và 1 ly giá 55.000đ, When khách xem giỏ, Then tổng tiền là 135.000đ.
+- AC-03.4: Given giỏ có món, When khách tăng, giảm số lượng, đổi tùy chọn hoặc xóa món, Then thành tiền và tổng tiền được cập nhật ngay.
+- AC-03.5: Given một dòng có số lượng 1, When khách bấm giảm, Then dòng đó bị xóa khỏi giỏ.
+- AC-03.6: Given số lượng trong giỏ đã bằng số phần còn lại của món, When khách xem nút tăng, Then nút tăng không dùng được.
+- AC-03.7: Given khách đã thêm món vào giỏ, When khách đóng rồi mở lại trang, Then các món vẫn còn trong giỏ.
+- AC-03.8: Given giỏ hàng trống, When khách mở giỏ, Then khách thấy thông báo "Giỏ hàng trống" và nút quay về thực đơn.
+- AC-03.9: Given khách chưa đăng nhập, When khách bấm "Thanh toán", Then hệ thống yêu cầu đăng nhập và sau khi đăng nhập đưa khách quay lại bước thanh toán.
+- AC-03.10: Given giỏ đang chứa món của một khách, When một khách khác đăng nhập trên cùng thiết bị, Then khách mới không thấy món của khách trước.
+
+### FR-04 – Đăng ký và đăng nhập
+
+**Mô tả.** Xác định danh tính để đơn hàng, điểm tích lũy và lịch sử thuộc đúng người; đồng thời phân biệt khách hàng với quản trị viên. Người dùng: khách hàng, quản trị viên.
+
+**Các bước thực hiện – đăng ký**
+1. Khách chọn "Đăng ký".
+2. Khách nhập email, mật khẩu và các thông tin cá nhân (họ tên, số điện thoại, giới tính – không bắt buộc).
+3. Khách gửi đăng ký và nhận thông báo kết quả.
+4. Khách đăng nhập bằng tài khoản vừa tạo.
+
+**Các bước thực hiện – đăng nhập và quản lý tài khoản**
+1. Người dùng nhập email và mật khẩu rồi chọn "Đăng nhập".
+2. Hệ thống đưa người dùng vào đúng khu vực: khách hàng vào cửa hàng, quản trị viên vào khu quản trị.
+3. Khi cần, người dùng xem hoặc sửa thông tin cá nhân và đổi mật khẩu.
+4. Người dùng chọn "Đăng xuất" khi dùng xong.
+
+**Tiêu chí chấp nhận**
+- AC-04.1: Given email và số điện thoại chưa được dùng, mật khẩu hợp lệ, When khách đăng ký, Then tài khoản khách hàng được tạo và khách được báo đăng ký thành công.
+- AC-04.2: Given mật khẩu ngắn hơn 8 ký tự hoặc thiếu chữ hoa, chữ thường, chữ số hoặc ký tự đặc biệt, When khách đăng ký, Then hệ thống từ chối và nêu rõ mật khẩu cần đáp ứng điều kiện nào.
+- AC-04.3: Given email hoặc số điện thoại không đúng định dạng, When khách đăng ký, Then hệ thống từ chối và báo trường nào chưa hợp lệ.
+- AC-04.4: Given email hoặc số điện thoại đã có tài khoản, When khách đăng ký, Then hệ thống báo thông tin đã được sử dụng và không tạo tài khoản mới.
+- AC-04.5: Given tài khoản hợp lệ, When người dùng nhập đúng email và mật khẩu, Then người dùng được đăng nhập và thấy tên của mình trên màn hình.
+- AC-04.6: Given email hoặc mật khẩu sai, When người dùng đăng nhập, Then hệ thống báo "tài khoản hoặc mật khẩu không chính xác" mà không cho biết cái nào sai.
+- AC-04.7: Given tài khoản đã bị quản trị viên khóa, When người dùng đăng nhập, Then hệ thống từ chối và hướng dẫn liên hệ quản trị viên.
+- AC-04.8: Given người dùng đã đăng nhập hơn 24 giờ, When người dùng thực hiện thao tác cần đăng nhập, Then hệ thống yêu cầu đăng nhập lại.
+- AC-04.9: Given người dùng chưa đăng nhập, When truy cập chức năng đặt đơn, thanh toán, xem đơn hoặc khu quản trị, Then hệ thống đưa người dùng tới trang đăng nhập.
+- AC-04.10: Given khách hàng đã đăng nhập, When khách cố mở khu quản trị, Then hệ thống từ chối và không hiển thị dữ liệu quản trị.
+- AC-04.11: Given khách đã đăng nhập, When khách xem và sửa thông tin cá nhân, Then chỉ thông tin của chính khách được hiển thị và cập nhật.
+- AC-04.12: Given khách nhập sai mật khẩu hiện tại hoặc mật khẩu mới và phần xác nhận không trùng nhau, When đổi mật khẩu, Then hệ thống từ chối và mật khẩu cũ vẫn dùng được.
+- AC-04.13: Given người dùng đã đăng xuất, When người dùng bấm quay lại hoặc mở lại trang cần đăng nhập, Then hệ thống yêu cầu đăng nhập lại.
+
+### FR-05 – Đặt đơn
+
+**Mô tả.** Chuyển các món trong giỏ thành một đơn hàng chính thức, giữ chỗ nguyên liệu cho khách và tính đúng số tiền cần trả, kể cả khi áp dụng mã giảm giá. Người dùng: khách hàng đã đăng nhập.
+
+**Các bước thực hiện**
+1. Khách kiểm tra lại các món và tổng tiền ở bước thanh toán.
+2. Khách nhập mã giảm giá nếu có và xem số tiền được giảm.
+3. Khách xác nhận đặt đơn.
+4. Hệ thống tạo đơn ở trạng thái "Chờ thanh toán" và hiển thị mã đơn, tổng tiền, số tiền giảm, số tiền phải trả.
+5. Khách chuyển sang bước thanh toán.
+
+**Tiêu chí chấp nhận**
+- AC-05.1: Given khách đã đăng nhập và các món trong giỏ đều còn hàng, When khách xác nhận đặt đơn, Then đơn được tạo ở trạng thái "Chờ thanh toán" với mã đơn, tổng tiền, tiền giảm và số tiền phải trả.
+- AC-05.2: Given đơn được tạo, When hệ thống tính tiền, Then số tiền dựa trên giá niêm yết, phụ thu size và giá topping hiện hành của cửa hàng, không dựa trên số tiền khách nhìn thấy trước đó.
+- AC-05.3: Given đơn được tạo thành công, When kiểm tra số lượng còn lại, Then số phần còn lại của mỗi món giảm đúng bằng số lượng khách đã đặt.
+- AC-05.4: Given một món trong giỏ không còn đủ số lượng, When khách đặt đơn, Then hệ thống từ chối cả đơn, nêu rõ món nào và số lượng còn lại; không món nào bị trừ số lượng.
+- AC-05.5: Given món hoặc nhóm món đã bị ngừng bán, When khách đặt đơn, Then hệ thống từ chối và báo món không còn được phục vụ.
+- AC-05.6: Given size hoặc topping đã chọn không còn phục vụ, hoặc topping không phù hợp với nhóm món, When khách đặt đơn, Then hệ thống từ chối và nêu rõ lựa chọn không hợp lệ.
+- AC-05.7: Given giỏ hàng trống hoặc số lượng không hợp lệ, When khách đặt đơn, Then hệ thống từ chối và yêu cầu kiểm tra lại giỏ hàng.
+- AC-05.8: Given khách nhập mã giảm giá còn hiệu lực, còn lượt dùng và đơn đạt giá trị tối thiểu, When áp dụng, Then khách thấy số tiền được giảm và số tiền phải trả mới.
+- AC-05.9: Given mã giảm theo phần trăm có mức giảm tối đa, When tiền giảm tính ra vượt mức tối đa, Then tiền giảm chỉ bằng mức tối đa.
+- AC-05.10: Given mã giảm giá có giá trị lớn hơn tổng tiền đơn, When áp dụng, Then tiền giảm không vượt quá tổng tiền đơn.
+- AC-05.11: Given mã không tồn tại, đã bị khóa, chưa đến ngày áp dụng, đã hết hạn, đã hết lượt dùng hoặc đơn chưa đạt giá trị tối thiểu, When khách áp dụng, Then hệ thống báo rõ lý do và không áp dụng giảm giá.
+- AC-05.12: Given đơn có áp dụng mã giảm giá được tạo thành công, When kiểm tra mã, Then số lượt đã dùng của mã tăng thêm 1.
+- AC-05.13: Given hai khách cùng đặt món chỉ còn 1 phần vào cùng một thời điểm, When cả hai xác nhận, Then chỉ một khách đặt được và khách còn lại nhận thông báo món vừa hết hoặc thay đổi số lượng.
+- AC-05.14: Given tài khoản đã bị khóa, When khách đặt đơn, Then hệ thống từ chối đặt đơn.
+- AC-05.15: Given đơn mới được tạo, When quản trị viên mở khu quản trị, Then quản trị viên nhận được thông báo có đơn mới.
+- AC-05.16: Given đơn có thể mang lại điểm tích lũy, When đơn được tạo, Then khách thấy số điểm dự kiến nhận (cứ 10.000đ phải trả được 1 điểm, tính theo phần nguyên).
+
+### FR-06 – Thanh toán
+
+**Mô tả.** Cho khách trả tiền cho đơn bằng Ví hoặc Thẻ để cửa hàng bắt đầu chuẩn bị đồ uống. Khách chỉ bị tính tiền một lần cho mỗi đơn. Người dùng: khách hàng; dịch vụ thanh toán xử lý giao dịch.
+
+**Các bước thực hiện**
+1. Khách chọn phương thức thanh toán: Ví hoặc Thẻ.
+2. Khách xác nhận thanh toán.
+3. Dịch vụ thanh toán trả về kết quả.
+4. Nếu thành công: hệ thống hiển thị màn hình xác nhận, đơn chuyển sang "Đã thanh toán", khách được cộng điểm tích lũy và giỏ hàng được làm trống.
+5. Nếu thất bại: hệ thống báo lỗi, đơn chuyển sang "Thanh toán thất bại"; khách thử lại hoặc đổi phương thức.
+
+**Tiêu chí chấp nhận**
+- AC-06.1: Given đơn ở trạng thái "Chờ thanh toán" hoặc "Thanh toán thất bại", When khách chọn Ví hoặc Thẻ và dịch vụ thanh toán báo thành công, Then đơn chuyển sang "Đã thanh toán", số tiền ghi nhận đúng bằng số tiền phải trả và khách có mã giao dịch.
+- AC-06.2: Given thanh toán thành công, When khách xem tài khoản, Then điểm tích lũy tăng theo quy tắc cứ 10.000đ được 1 điểm (tính theo phần nguyên).
+- AC-06.3: Given thanh toán thành công, When khách quay lại giỏ hàng, Then giỏ hàng đã được làm trống.
+- AC-06.4: Given thanh toán thành công, When quản trị viên mở khu quản trị, Then quản trị viên thấy thông báo đơn đã thanh toán và đơn xuất hiện trong danh sách chờ pha chế.
+- AC-06.5: Given dịch vụ thanh toán báo thất bại, When khách thanh toán, Then đơn chuyển sang "Thanh toán thất bại", khách không bị cộng điểm và khách thấy thông báo lỗi kèm lựa chọn thử lại hoặc đổi phương thức.
+- AC-06.6: Given thanh toán thất bại, When khách thanh toán lại, Then hệ thống xử lý như một lần thanh toán mới và đơn có thể chuyển sang "Đã thanh toán".
+- AC-06.7: Given khách bấm xác nhận thanh toán nhiều lần cho cùng một lần thanh toán (ví dụ bấm đúp hoặc mạng chậm), When hệ thống xử lý, Then khách chỉ bị tính tiền một lần và nhận lại cùng một kết quả.
+- AC-06.8: Given đơn đã thanh toán, When khách thanh toán lại cho đơn đó, Then hệ thống từ chối và báo đơn đã được thanh toán.
+- AC-06.9: Given đơn đã hủy hoặc đã hoàn tất, When khách thanh toán, Then hệ thống từ chối và báo đơn không thể thanh toán.
+- AC-06.10: Given số tiền thanh toán thấp hơn số tiền phải trả, When khách xác nhận, Then hệ thống từ chối giao dịch.
+- AC-06.11: Given khách chưa chọn phương thức hoặc chọn phương thức không được hỗ trợ, When khách xác nhận, Then hệ thống yêu cầu chọn Ví hoặc Thẻ.
+- AC-06.12: Given một đơn không thuộc về khách đang đăng nhập, When khách cố thanh toán đơn đó, Then hệ thống từ chối.
+- AC-06.13: Given thanh toán thất bại, When quản trị viên mở khu quản trị, Then quản trị viên thấy thông báo thanh toán thất bại của đơn đó.
+
+### FR-07 – Lịch sử và theo dõi đơn
+
+**Mô tả.** Giúp khách biết đơn của mình đang ở bước nào và xem lại các đơn đã đặt. Người dùng: khách hàng đã đăng nhập.
+
+**Các bước thực hiện**
+1. Sau khi thanh toán, khách xem màn hình xác nhận đơn với mã đơn và trạng thái.
+2. Khách mở mục "Đơn của tôi" để xem danh sách đơn đã đặt, đơn mới nhất ở trên cùng.
+3. Khách chọn một đơn để xem chi tiết: các món, tùy chọn, tiền giảm, số tiền đã trả, trạng thái.
+4. Khách quay lại theo dõi cho đến khi đơn "Sẵn sàng" và đến quầy nhận đồ uống.
+
+**Tiêu chí chấp nhận**
+- AC-07.1: Given khách đã đặt đơn, When khách mở "Đơn của tôi", Then khách chỉ thấy các đơn của chính mình, đơn mới nhất ở trên cùng.
+- AC-07.2: Given khách mở chi tiết một đơn, When trang hiển thị, Then khách thấy từng món với size, topping, số lượng, thành tiền, tiền giảm, số tiền phải trả, lịch sử thanh toán và trạng thái hiện tại.
+- AC-07.3: Given đơn đã đặt, When cửa hàng đổi giá, đổi tên hoặc ngừng bán món đó, Then đơn cũ vẫn hiển thị đúng tên và giá tại thời điểm khách đặt.
+- AC-07.4: Given quản trị viên cập nhật trạng thái đơn, When khách đang xem hoặc tải lại trang theo dõi, Then khách thấy trạng thái mới trong vòng 10 giây.
+- AC-07.5: Given khách cố mở chi tiết đơn của người khác, When trang hiển thị, Then hệ thống từ chối và không hiển thị thông tin đơn.
+- AC-07.6: Given khách chưa có đơn nào, When mở "Đơn của tôi", Then khách thấy thông báo chưa có đơn và nút quay về thực đơn.
+- AC-07.7: Given đơn ở trạng thái "Thanh toán thất bại" hoặc "Chờ thanh toán", When khách xem đơn, Then khách thấy lối đi để thanh toán lại.
+- AC-07.8: Given đơn đã bị hủy, When khách xem đơn, Then khách thấy trạng thái "Đã hủy".
+
+### FR-08 – Quản lý đơn hàng
+
+**Mô tả.** Giúp cửa hàng nhìn thấy các đơn cần làm, báo tiến độ cho khách và hủy đơn khi cần mà số liệu vẫn chính xác. Người dùng: quản trị viên.
+
+**Các bước thực hiện**
+1. Quản trị viên đăng nhập và mở khu quản trị.
+2. Quản trị viên xem danh sách đơn, lọc theo nhóm trạng thái (nhận đơn, đang xử lý, hoàn tất, đã hủy).
+3. Quản trị viên mở một đơn để xem chi tiết các món cần pha chế.
+4. Quản trị viên cập nhật trạng thái theo tiến độ: Đang pha chế, Sẵn sàng, Hoàn tất.
+5. Khi cần, quản trị viên hủy đơn và xác nhận.
+
+**Tiêu chí chấp nhận**
+- AC-08.1: Given quản trị viên đã đăng nhập, When mở danh sách đơn, Then quản trị viên thấy tất cả đơn của mọi khách, đơn mới nhất ở trên cùng, kèm khách hàng, món, thanh toán và trạng thái.
+- AC-08.2: Given danh sách đơn, When quản trị viên chọn một nhóm trạng thái, Then chỉ các đơn thuộc nhóm đó hiển thị và số lượng đơn của từng nhóm được thể hiện.
+- AC-08.3: Given đơn "Đã thanh toán", When quản trị viên chuyển sang "Đang pha chế", Then đơn đổi trạng thái và khách thấy trạng thái mới khi theo dõi.
+- AC-08.4: Given đơn "Đang pha chế", When quản trị viên chuyển lần lượt sang "Sẵn sàng" rồi "Hoàn tất", Then mỗi lần chuyển đều được ghi nhận đúng thứ tự.
+- AC-08.5: Given quản trị viên chọn một bước không hợp lệ theo bảng trạng thái (ví dụ từ "Đã thanh toán" sang "Hoàn tất"), When xác nhận, Then hệ thống từ chối, nêu rõ không thể chuyển và trạng thái đơn giữ nguyên.
+- AC-08.6: Given đơn đã "Hoàn tất" hoặc "Đã hủy", When quản trị viên cố đổi trạng thái, Then hệ thống từ chối.
+- AC-08.7: Given đơn chưa pha chế (Chờ thanh toán, Thanh toán thất bại hoặc Đã thanh toán), When quản trị viên hủy đơn, Then đơn chuyển sang "Đã hủy", số lượng các món được trả lại cho cửa hàng và lượt dùng mã giảm giá (nếu có) được hoàn lại.
+- AC-08.8: Given đơn đã thanh toán và đã được cộng điểm, When đơn bị hủy, Then điểm tích lũy đã cộng cho khách bị thu hồi.
+- AC-08.9: Given đơn đã "Đang pha chế" trở đi, When quản trị viên hủy đơn, Then hệ thống từ chối.
+- AC-08.10: Given đơn bị hủy, When quản trị viên xem thông báo, Then có thông báo đơn đã hủy và số lượng, mã giảm giá đã được hoàn trả.
+- AC-08.11: Given khách hàng thường, When cố mở khu quản lý đơn, Then hệ thống từ chối.
+- AC-08.12: Given quản trị viên đổi trạng thái đơn, When thao tác thành công, Then quản trị viên thấy thông báo xác nhận đã cập nhật.
+
+## 5. Bảng yêu cầu phi chức năng
+
+| Mã | Nhóm | Mô tả | MoSCoW |
+|---|---|---|---|
+| NFR-01 | Hiệu năng | Thực đơn và các màn hình chính phản hồi nhanh, kể cả khi nhiều khách cùng sử dụng và dùng mạng điện thoại | Must |
+| NFR-02 | Bảo mật | Bảo vệ mật khẩu, thông tin cá nhân, đơn hàng và các chức năng quản trị | Must |
+| NFR-03 | Tính dễ sử dụng | Dùng thuận tiện trên điện thoại, có thể thêm vào màn hình chính như một ứng dụng, thông báo rõ ràng bằng tiếng Việt | Must |
+| NFR-04 | Phát hành và vận hành | Người ngoài nhóm có thể cài đặt, chạy thử; mỗi phiên bản phát hành đều được kiểm tra tự động và có thể quay lại phiên bản trước nếu có sự cố | Must |
+| NFR-05 | Độ tin cậy và toàn vẹn dữ liệu | Không mất đơn, không trùng đơn, không tính tiền hai lần; có cách kiểm tra tình trạng hoạt động và ghi nhận sự cố | Should |
+
+### Tiêu chí chấp nhận – yêu cầu phi chức năng
+
+**NFR-01 – Hiệu năng**
+- AC-N01.1: Given 50 khách cùng mở thực đơn một lúc, When đo thời gian phản hồi, Then ít nhất 95% lượt mở có kết quả trong vòng 1 giây.
+- AC-N01.2: Given điện thoại dùng mạng 4G thông thường, When khách mở trang thực đơn lần đầu, Then nội dung chính hiển thị đầy đủ trong vòng 2,5 giây.
+- AC-N01.3: Given khách thao tác trên giỏ hàng (thêm, bớt, xóa), When thao tác được thực hiện, Then tổng tiền được cập nhật ngay, không cần chờ tải lại trang.
+
+**NFR-02 – Bảo mật**
+- AC-N02.1: Given một tài khoản đã đăng ký, When người quản lý hệ thống kiểm tra dữ liệu lưu trữ, Then không ai có thể đọc được mật khẩu gốc của tài khoản.
+- AC-N02.2: Given khách đang đăng nhập, When khách thao tác, Then khách chỉ xem và thay đổi được thông tin và đơn hàng của chính mình.
+- AC-N02.3: Given người dùng không phải quản trị viên, When thử vào bất kỳ chức năng quản trị nào (đơn hàng, thực đơn, mã giảm giá, người dùng, báo cáo, thông báo), Then hệ thống từ chối.
+- AC-N02.4: Given người dùng chưa đăng nhập, When thử thanh toán, xem đơn hoặc xem thông báo, Then hệ thống từ chối và yêu cầu đăng nhập.
+- AC-N02.5: Given khách dùng hệ thống trên Internet, When gửi thông tin đăng nhập hoặc thanh toán, Then thông tin được truyền qua kết nối bảo mật; truy cập bằng kết nối không bảo mật được tự động chuyển sang kết nối bảo mật.
+- AC-N02.6: Given kho mã nguồn và nhật ký phát hành của nhóm, When rà soát, Then không có mật khẩu, khóa bí mật hay thông tin truy cập hệ thống nào bị công khai.
+- AC-N02.7: Given khách tải ảnh lên (đối với quản trị viên), When tệp không phải ảnh hoặc quá 5 MB, Then hệ thống từ chối tệp.
+- AC-N02.8: Given dữ liệu khách nhập sai hoặc có nội dung bất thường, When gửi lên, Then hệ thống báo lỗi dễ hiểu và vẫn hoạt động bình thường.
+
+**NFR-03 – Tính dễ sử dụng**
+- AC-N03.1: Given màn hình điện thoại có chiều rộng 360, 390 hoặc 768 điểm ảnh, When khách dùng thực đơn, giỏ hàng và thanh toán, Then nội dung hiển thị đầy đủ, không phải kéo ngang.
+- AC-N03.2: Given khách dùng trình duyệt trên điện thoại, When khách chọn thêm vào màn hình chính, Then biểu tượng BrewLite xuất hiện và mở được như một ứng dụng.
+- AC-N03.3: Given khách mới, When khách đặt một đồ uống từ thực đơn đến khi nhận xác nhận đơn, Then khách hoàn thành trong không quá 6 bước bấm (không tính nhập thông tin đăng nhập).
+- AC-N03.4: Given khách gặp lỗi (hết hàng, mã giảm giá sai, thanh toán thất bại), When thông báo hiện ra, Then thông báo bằng tiếng Việt, nêu rõ nguyên nhân và việc khách cần làm tiếp.
+- AC-N03.5: Given số tiền hiển thị trong toàn hệ thống, When khách xem, Then tiền được hiển thị theo dạng đồng Việt Nam có dấu chấm ngăn cách hàng nghìn (ví dụ 51.000đ).
+- AC-N03.6: Given khách dùng bàn phím hoặc trình đọc màn hình, When thao tác trên thực đơn và giỏ hàng, Then các nút chính đều có nhãn mô tả và dùng được.
+
+**NFR-04 – Phát hành và vận hành**
+- AC-N04.1: Given một người ngoài nhóm có kho mã nguồn và tệp hướng dẫn, When làm theo hướng dẫn, Then người đó chạy được toàn bộ hệ thống trên máy của mình mà không cần hỏi nhóm.
+- AC-N04.2: Given dữ liệu mẫu của cửa hàng (món, nhóm, topping, mã giảm giá, tài khoản mẫu), When người đó nạp lại trên hệ thống trống, Then thu được cùng một bộ dữ liệu mỗi lần.
+- AC-N04.3: Given một thay đổi mới được đề xuất, When nhóm gửi đề xuất, Then hệ thống tự động kiểm tra chất lượng mã nguồn, chạy kiểm thử và dựng thử; nếu một bước thất bại thì thay đổi không được đưa vào bản chính.
+- AC-N04.4: Given một phiên bản mới được đánh dấu phát hành, When quy trình phát hành chạy, Then phiên bản được đóng gói, đưa lên môi trường chính thức và được kiểm tra nhanh sau khi phát hành.
+- AC-N04.5: Given kiểm tra nhanh sau phát hành thất bại, When quy trình dừng, Then nhóm có hướng dẫn rõ ràng để quay lại phiên bản trước đó.
+- AC-N04.6: Given môi trường chính thức, When giảng viên hoặc khách truy cập, Then truy cập được trang web của khách hàng qua đường dẫn công khai bằng kết nối bảo mật.
+- AC-N04.7: Given thông tin cấu hình cần thiết để chạy hệ thống, When người mới cài đặt, Then có tệp mẫu liệt kê đầy đủ các thông tin cần điền.
+
+**NFR-05 – Độ tin cậy và toàn vẹn dữ liệu**
+- AC-N05.1: Given quá trình tạo đơn bị gián đoạn giữa chừng, When hệ thống phục hồi, Then không có đơn dở dang và số lượng các món không bị trừ sai.
+- AC-N05.2: Given hai khách cùng đặt món chỉ còn 1 phần, When cả hai xác nhận cùng lúc, Then chỉ một đơn thành công và số lượng còn lại không bao giờ nhỏ hơn 0.
+- AC-N05.3: Given khách gửi cùng một yêu cầu thanh toán nhiều lần, When hệ thống xử lý, Then chỉ có một giao dịch được ghi nhận.
+- AC-N05.4: Given nhóm cần biết hệ thống có đang hoạt động bình thường, When kiểm tra tình trạng, Then hệ thống cho biết đang hoạt động và kết nối dữ liệu bình thường; nếu mất kết nối dữ liệu thì báo không hoạt động.
+- AC-N05.5: Given hệ thống đang chạy, When có yêu cầu hoặc lỗi xảy ra, Then hệ thống ghi nhận thời gian và nội dung sự cố để nhóm tra cứu, nhưng không ghi mật khẩu của người dùng.
+- AC-N05.6: Given các nghiệp vụ quan trọng (đặt đơn, thanh toán, đổi trạng thái đơn), When nhóm chạy bộ kiểm thử, Then có kiểm thử tự động cho từng nghiệp vụ và ít nhất một kiểm thử trọn luồng từ xem thực đơn đến xác nhận đơn.
+
+## 6. Chức năng quản trị bổ sung và ngoài phạm vi
+
+| Nội dung | Mô tả | MoSCoW |
+|---|---|---|
+| Quản lý thực đơn | Quản trị viên thêm, sửa, ẩn hoặc khôi phục đồ uống, nhóm đồ uống, topping; cập nhật giá, size, số lượng còn lại và hình ảnh | Should |
+| Quản lý mã giảm giá | Quản trị viên tạo, sửa, khóa hoặc khôi phục mã giảm giá theo phần trăm hoặc số tiền cố định | Should |
+| Quản lý người dùng | Quản trị viên tạo tài khoản quản trị, xem danh sách, khóa hoặc mở khóa tài khoản | Could |
+| Thông báo cho quản trị viên | Báo đơn mới, đơn đã thanh toán, thanh toán thất bại, đơn bị hủy, món sắp hết hoặc đã hết | Could |
+| Báo cáo và tổng quan | Doanh thu, số đơn theo trạng thái, món bán chạy, khách mua nhiều, tình hình tồn kho | Could |
+| Tích điểm | Khách nhận 1 điểm cho mỗi 10.000đ thanh toán thành công | Could |
+| Thanh toán thật qua tổ chức tài chính | Giai đoạn đầu chỉ dùng thanh toán mô phỏng | Won't |
+| Giao hàng tận nơi | Khách nhận đồ uống tại quầy | Won't |
+| Ứng dụng riêng cho iOS/Android | Dùng trang web trên điện thoại | Won't |
+| Đổi điểm lấy ưu đãi | Chưa có trong giai đoạn đầu | Won't |
+
+## 7. Sơ đồ use-case tổng quát
+
+![Sơ đồ Use Case](../diagrams/usecase-diagram.png)
+
+```plantuml
+@startuml usecase-overview
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam actorStyle awesome
+skinparam padding 12
+skinparam dpi 150
+
+actor "Khách hàng" as Customer
+actor "Quản trị viên\n(Admin)" as Admin
+actor "Payment Service" as PaymentService <<system>>
+
+rectangle "BrewLite" {
+  ' --- Phân hệ Khách hàng ---
+  usecase "Xem menu & Danh mục" as UC_Menu
+  usecase "Xem chi tiết & Tuỳ chọn\n(Size, Topping)" as UC_Detail
+  usecase "Quản lý giỏ hàng" as UC_Cart
+  usecase "Đặt đơn hàng" as UC_Order
+  usecase "Áp dụng mã giảm giá" as UC_Coupon
+  usecase "Thanh toán đơn hàng" as UC_Pay
+  usecase "Thử lại thanh toán" as UC_RetryPay
+  usecase "Xem lịch sử & Theo dõi đơn" as UC_History
+  usecase "Đăng ký / Đăng nhập" as UC_Customer_Auth
+
+  ' --- Phân hệ Quản trị viên ---
+  usecase "Đăng nhập" as UC_Admin_Login
+  usecase "Quản lý thực đơn & Giảm giá" as UC_Admin_Menu
+  usecase "Tiếp nhận & Cập nhật trạng thái đơn" as UC_Admin_Order
+  usecase "Xem thông báo hệ thống" as UC_Admin_Noti
+}
+
+' ================= LIÊN KẾT KHÁCH HÀNG =================
+Customer --> UC_Menu
+Customer --> UC_Detail
+Customer --> UC_Cart
+Customer --> UC_Order
+Customer --> UC_History
+Customer --> UC_Customer_Auth
+
+' Ràng buộc luồng Khách hàng
+UC_Order ..> UC_Pay : <<include>>
+UC_Order ..> UC_Customer_Auth : <<include>>
+UC_History ..> UC_Customer_Auth : <<include>>
+
+UC_Coupon .> UC_Order : <<extend>>
+UC_RetryPay .> UC_Pay : <<extend>>
+
+' Liên kết bên ngoài
+UC_Pay -- PaymentService
+
+' ================= LIÊN KẾT QUẢN TRỊ VIÊN =================
+Admin --> UC_Admin_Login
+Admin --> UC_Admin_Menu
+Admin --> UC_Admin_Order
+Admin --> UC_Admin_Noti
+
+' Ràng buộc luồng Quản trị viên
+UC_Admin_Menu ..> UC_Admin_Login : <<include>>
+UC_Admin_Order ..> UC_Admin_Login : <<include>>
+@enduml
+```
+
+### Liên hệ giữa use-case và yêu cầu
+
+| Mã UC | Tên Use Case | Tác nhân (Actor) | Yêu cầu chức năng (FR) | Yêu cầu phi chức năng (NFR) | Tiêu chí chấp nhận (AC) tương ứng | Mức độ |
+|---|---|---|---|---|---|:---:|
+| **UC-01** | Xem menu & Danh mục | Khách hàng | FR-01 (Xem thực đơn) | NFR-01 (Hiệu năng), NFR-03 (Tính dễ sử dụng) | AC-01.1 – AC-01.8, AC-N01.1, AC-N01.2, AC-N03.1 | Must |
+| **UC-02** | Xem chi tiết & Tuỳ chọn (Size, Topping) | Khách hàng | FR-02 (Xem chi tiết và chọn tùy chọn) | NFR-03 (Tính dễ sử dụng) | AC-02.1 – AC-02.9, AC-N03.5 | Must |
+| **UC-03** | Quản lý giỏ hàng | Khách hàng | FR-03 (Giỏ hàng) | NFR-01 (Hiệu năng), NFR-03 (Tính dễ sử dụng) | AC-03.1 – AC-03.10, AC-N01.3 | Must |
+| **UC-04** | Đăng ký / Đăng nhập (Khách hàng) | Khách hàng | FR-04 (Đăng ký và đăng nhập) | NFR-02 (Bảo mật) | AC-04.1 – AC-04.6, AC-04.8, AC-04.9, AC-04.11 – AC-04.13, AC-N02.1, AC-N02.4, AC-N02.5 | Must |
+| **UC-05** | Đặt đơn hàng | Khách hàng | FR-05 (Đặt đơn) | NFR-02 (Bảo mật), NFR-05 (Độ tin cậy & toàn vẹn dữ liệu) | AC-05.1 – AC-05.7, AC-05.13, AC-05.14, AC-N05.1, AC-N05.2 | Must |
+| **UC-06** | Áp dụng mã giảm giá | Khách hàng | FR-05 (Đặt đơn) | NFR-05 (Độ tin cậy & toàn vẹn dữ liệu) | AC-05.8 – AC-05.12, AC-N03.4 | Must |
+| **UC-07** | Thanh toán đơn hàng | Khách hàng, Payment Service | FR-06 (Thanh toán) | NFR-02 (Bảo mật), NFR-05 (Độ tin cậy & toàn vẹn dữ liệu) | AC-06.1 – AC-06.4, AC-06.7 – AC-06.12, AC-N05.3 | Must |
+| **UC-08** | Thử lại thanh toán | Khách hàng, Payment Service | FR-06 (Thanh toán) | NFR-05 (Độ tin cậy & toàn vẹn dữ liệu) | AC-06.5, AC-06.6, AC-07.7, AC-N03.4 | Must |
+| **UC-09** | Xem lịch sử & Theo dõi đơn | Khách hàng | FR-07 (Lịch sử và theo dõi đơn) | NFR-01 (Hiệu năng), NFR-02 (Bảo mật), NFR-03 (Tính dễ sử dụng) | AC-07.1 – AC-07.6, AC-07.8, AC-N02.2 | Must |
+| **UC-10** | Đăng nhập (Quản trị viên) | Quản trị viên (Admin) | FR-04 (Đăng ký và đăng nhập) | NFR-02 (Bảo mật) | AC-04.5 – AC-04.10, AC-N02.3, AC-N02.5 | Must |
+| **UC-11** | Tiếp nhận & Cập nhật trạng thái đơn | Quản trị viên (Admin) | FR-08 (Quản lý đơn hàng) | NFR-02 (Bảo mật), NFR-05 (Độ tin cậy & toàn vẹn dữ liệu) | AC-08.1 – AC-08.12, AC-N02.3, AC-N05.5 | Must |
+| **UC-12** | Quản lý thực đơn & Giảm giá | Quản trị viên (Admin) | Quản lý thực đơn, Quản lý mã giảm giá (Mục 6) | NFR-02 (Bảo mật) | Tiêu chí tại Mục 6, AC-N02.3, AC-N02.7 | Should |
+| **UC-13** | Xem thông báo hệ thống | Quản trị viên (Admin) | Thông báo quản trị viên (Mục 6) | NFR-02 (Bảo mật) | AC-05.15, AC-06.4, AC-06.13, AC-08.10, AC-N02.3 | Could |
+| **Toàn bộ** | Toàn hệ thống | Cả hai Actor | Quản lý triển khai, vận hành | NFR-04 (Phát hành và vận hành) | AC-N04.1 – AC-N04.7 | Must |
+
+
+
+==================== FILE: docs\requirements\usecase-checkout.md ====================
+# Đặc tả Use-case trọng tâm: Đặt và thanh toán đơn hàng (UC-05, UC-07)
+
+> Tệp: `docs/requirements/usecase-checkout.md`  
+> Task 1.3 | Dự án: BrewLite (PWA – Next.js, NestJS, PostgreSQL) | Liên kết: `srs.md` (v1.0)
+
+## 1. Phạm vi và mục tiêu
+
+Tài liệu mô tả chi tiết hai use-case có giá trị nghiệp vụ cao nhất của BrewLite:
+
+- **UC-05 – Đặt đơn hàng (FR-05):** chuyển giỏ hàng thành đơn `PENDING`, giữ tồn kho, áp mã giảm giá.
+- **UC-07 – Thanh toán đơn hàng (FR-06):** thanh toán bằng Ví/Thẻ qua Payment Service, cập nhật đơn thành `PAID`.
+
+## 2. Sơ đồ use-case
+
+![Sơ đồ Use Case Đặt và thanh toán](../diagrams/usecase-checkout.png)
+
+```plantuml
+@startuml
+left to right direction
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam nodesep 30
+skinparam ranksep 40
+skinparam ArrowFontSize 11
+
+actor "Khách hàng" as Customer
+actor "Payment Service" as Payment <<system>>
+
+rectangle "Phân hệ Đặt & Thanh toán - BrewLite" {
+  usecase "Quản lý giỏ hàng\n(UC-03)" as UC_03
+  usecase "Đăng ký / Đăng nhập\n(UC-04)" as UC_04
+  usecase "Đặt đơn hàng\n(UC-05)" as UC_05
+  usecase "Áp dụng mã giảm giá\n(UC-06)" as UC_06
+  usecase "Thanh toán đơn hàng\n(UC-07)" as UC_07
+  usecase "Thử lại thanh toán\n(UC-08)" as UC_08
+}
+
+Customer --> UC_03
+Customer --> UC_05
+
+UC_05 ..> UC_04 : <<include>>
+UC_05 ..> UC_07 : <<include>>
+UC_05 <.. UC_06 : <<extend>>
+
+UC_07 --> Payment
+UC_07 <.. UC_08 : <<extend>>
+@enduml
+```
+
+## 3. Đặc tả Use-case UC-05 – Đặt đơn hàng
+
+| Mục | Nội dung |
+|---|---|
+| **Use-case name** | UC-05 – Đặt đơn hàng |
+| **Actor** | Chính: Khách hàng (đã đăng nhập). Hỗ trợ: không có |
+| **Description** | UC-05 đóng vai trò là **Quy trình thanh toán tổng thể (Checkout Flow)**, bao gồm (`<<include>>`) bước Thanh toán (UC-07). Khách chuyển các món trong giỏ hàng thành một đơn chính thức; hệ thống giữ phần đồ uống cho khách, áp mã giảm giá (nếu có), tính đúng số tiền phải trả, rồi tự động chuyển khách sang bước thanh toán để hoàn tất quy trình. |
+| **Trigger** | Khách bấm **"Thanh toán"** tại giỏ hàng, rồi xác nhận đặt đơn. |
+| **Preconditions** | 1. Khách đã đăng nhập và phiên đăng nhập còn hiệu lực (đăng nhập chưa quá 24 giờ), tài khoản không bị khóa.<br>2. Giỏ hàng có ít nhất một món, số lượng mỗi món từ 1 trở lên.<br>3. Các món, size và topping trong giỏ vẫn đang được cửa hàng phục vụ. |
+| **Postconditions** | **Khi đặt đơn thành công:** đơn được tạo ở trạng thái `PENDING`, lưu đúng tên món và giá tại thời điểm đặt; số lượng còn lại của từng món giảm đúng bằng số khách đã đặt; lượt dùng mã giảm giá (nếu có) tăng thêm 1; quản trị viên nhận thông báo có đơn mới.<br>**Khi đặt đơn thất bại:** hủy bỏ tiến trình, không lưu thay đổi. Không có đơn mới, không món nào bị trừ số lượng, mã giảm giá không bị tính lượt dùng, giỏ hàng giữ nguyên. |
+| **Normal Flow** | 1. Khách bấm "Thanh toán" tại giỏ hàng.<br>2. Hệ thống hiển thị lại các món và tổng tiền để khách kiểm tra.<br>3. Khách nhập mã giảm giá (nếu có, xem UC-06) và xác nhận đặt đơn.<br>4. Hệ thống kiểm tra phiên đăng nhập và tình trạng tài khoản của khách.<br>5. Hệ thống kiểm tra giỏ hàng: không trống, số lượng hợp lệ, món, size và topping còn phục vụ, topping phù hợp với nhóm món.<br>6. Hệ thống tính tiền theo giá niêm yết, phụ thu size và giá topping hiện hành của cửa hàng (không dùng số tiền khách đã thấy trước đó).<br>7. Hệ thống kiểm tra tồn kho theo thời gian thực và giữ lại số lượng đồ uống khách đặt.<br>8. Nếu có mã giảm giá, hệ thống kiểm tra mã còn dùng được, tính số tiền được giảm và trừ vào số tiền phải trả.<br>9. Hệ thống tạo đơn ở trạng thái `PENDING` và lưu lại toàn bộ thay đổi.<br>10. Hệ thống gửi thông báo đơn mới cho quản trị viên.<br>11. Hệ thống hiển thị mã đơn, tổng tiền, số tiền được giảm, số tiền phải trả và số điểm dự kiến nhận được (cứ 10.000đ phải trả được 1 điểm, tính theo phần nguyên).<br>12. Hệ thống tự động kích hoạt quy trình Thanh toán (UC-07) do có quan hệ include. Khách hàng không cần bấm thêm nút "Thanh toán" nào nữa để chuyển sang bước này. Trạng thái `PENDING` lúc này là trạng thái chờ xử lý giao dịch với cổng thanh toán. |
+| **Exceptions** | **Exception 1 – at step 7 (món hết hàng hoặc có người khác vừa đặt trước):**<br>7a. Nếu số lượng còn lại không đủ, hoặc có khách khác vừa đặt món đó trước vài giây, hệ thống kiểm tra lại số lượng còn lại.<br>7b. Nếu vẫn không đủ, hệ thống từ chối cả đơn, hủy bỏ tiến trình, không lưu thay đổi (không món nào bị trừ số lượng).<br>7c. Hệ thống thông báo lỗi hết hàng, nêu rõ món nào và còn bao nhiêu phần (hoặc món vừa hết / thay đổi số lượng). Khách quay về giỏ hàng để chỉnh lại.<br><br>**Exception 2 – at step 4 (chưa đăng nhập hoặc phiên đăng nhập hết hạn):**<br>4a. Hệ thống yêu cầu khách đăng nhập (hoặc đăng nhập lại).<br>4b. Sau khi đăng nhập, khách quay lại bước thanh toán và giỏ hàng vẫn còn nguyên.<br><br>**Exception 3 – at step 4 (tài khoản bị khóa):**<br>4c. Hệ thống từ chối đặt đơn và hướng dẫn khách liên hệ quản trị viên.<br><br>**Exception 4 – at step 5 (giỏ hàng hoặc lựa chọn không hợp lệ):**<br>5a. Nếu giỏ trống, số lượng sai, món hoặc nhóm món đã ngừng bán, size hoặc topping đã ngừng phục vụ, hoặc topping không phù hợp với nhóm món, hệ thống không tạo đơn.<br>5b. Hệ thống nêu rõ lựa chọn nào không hợp lệ và đề nghị khách kiểm tra lại giỏ hàng.<br><br>**Exception 5 – at step 8 (mã giảm giá không dùng được):**<br>8a. Nếu mã không tồn tại, đã bị khóa, chưa đến ngày áp dụng, đã hết hạn, hết lượt dùng hoặc đơn chưa đạt giá trị tối thiểu, hệ thống báo rõ lý do và không giảm giá.<br>8b. Khách có thể tiếp tục đặt đơn với giá gốc hoặc nhập mã khác. |
+| **Alternative Flows** | **Alternative 1 – at step 3 (khách có mã giảm giá – UC-06):**<br>3a. Khách nhập mã còn hiệu lực, còn lượt dùng và đơn đạt giá trị tối thiểu. Hệ thống hiển thị số tiền được giảm và số tiền phải trả mới. Với mã giảm theo phần trăm, mức giảm không vượt quá mức giảm tối đa của mã; mức giảm cũng không vượt quá tổng tiền đơn.<br><br>**Alternative 2 – at step 3 (khách muốn đổi món):**<br>3b. Khách quay lại giỏ hàng, thêm bớt món rồi bấm "Thanh toán" lại từ bước 1. |
+| **Requirements** | FR-05; NFR-02, NFR-05; AC-05.1 → AC-05.7, AC-05.13 → AC-05.16, AC-N05.1, AC-N05.2. Phần mã giảm giá (UC-06): AC-05.8 → AC-05.12 |
+
+## 4. Đặc tả Use-case UC-07 – Thanh toán đơn hàng
+
+| Mục | Nội dung |
+|---|---|
+| **Use-case name** | UC-07 – Thanh toán đơn hàng |
+| **Actor** | Chính: Khách hàng (đã đăng nhập). Hỗ trợ: Dịch vụ thanh toán (bên xử lý giao dịch Ví/Thẻ; giai đoạn đầu là bản mô phỏng) |
+| **Description** | Khách trả tiền cho đơn bằng Ví hoặc Thẻ để cửa hàng bắt đầu pha chế. Dù khách bấm nút thanh toán nhiều lần, khách chỉ bị tính tiền một lần. **Khách hàng có thể thanh toán lại từ màn hình "Đơn của tôi" (UC-08).** |
+| **Trigger** | Khách chọn Ví hoặc Thẻ và bấm **"Xác nhận thanh toán"** (ngay sau khi đặt đơn, hoặc từ mục "Đơn của tôi"). |
+| **Preconditions** | 1. Khách vào UC-07 thông qua UC-05 (được kích hoạt tự động) hoặc thông qua chức năng Thử lại thanh toán (UC-08).<br>2. Đơn cần thanh toán là đơn của chính khách.<br>3. Đơn đang ở trạng thái `PENDING` hoặc `PAYMENT_FAILED`.<br>4. Khách đã chọn phương thức thanh toán là Ví hoặc Thẻ. |
+| **Postconditions** | **Khi thanh toán thành công:** đơn chuyển sang `PAID`; số tiền ghi nhận đúng bằng số tiền phải trả; khách nhận mã giao dịch; điểm tích lũy được cộng (cứ 10.000đ được 1 điểm, tính theo phần nguyên); giỏ hàng được làm trống; quản trị viên nhận thông báo đơn đã thanh toán và đơn xuất hiện trong danh sách chờ pha chế.<br>**Khi thanh toán thất bại:** đơn chuyển sang `PAYMENT_FAILED`; khách không bị trừ tiền và không được cộng điểm; giỏ hàng và số lượng đồ uống đã giữ không đổi; quản trị viên nhận thông báo thanh toán thất bại; khách có thể thử lại hoặc đổi phương thức (UC-08).<br>**Khi khách bấm thanh toán nhiều lần:** chỉ có một giao dịch được ghi nhận và khách nhận lại cùng một kết quả. |
+| **Normal Flow** | 1. Khách chọn Ví hoặc Thẻ và bấm "Xác nhận thanh toán".<br>2. Hệ thống kiểm tra phiên đăng nhập và kiểm tra đơn có đúng là của khách.<br>3. Hệ thống kiểm soát việc bấm nút thanh toán nhiều lần: nếu đây là lần bấm đầu tiên cho lần thanh toán này thì tiếp tục xử lý.<br>4. Hệ thống kiểm tra đơn đang ở trạng thái cho phép thanh toán, khách đã chọn phương thức được hỗ trợ và số tiền thanh toán đúng bằng số tiền phải trả.<br>5. Hệ thống gửi yêu cầu thanh toán sang dịch vụ thanh toán.<br>6. Dịch vụ thanh toán xử lý giao dịch và báo thành công kèm mã giao dịch.<br>7. Hệ thống chuyển đơn sang `PAID`, ghi nhận giao dịch, cộng điểm tích lũy và làm trống giỏ hàng.<br>8. Hệ thống ghi nhớ kết quả của lần thanh toán này và gửi thông báo đơn đã thanh toán cho quản trị viên.<br>9. Hệ thống hiển thị màn hình xác nhận với mã đơn, trạng thái và mã giao dịch.<br>10. Khách theo dõi tiến độ đơn cho đến khi nhận đồ uống tại quầy (FR-07). |
+| **Exceptions** | **Exception 1 – at step 5 hoặc 6 (thanh toán lỗi hoặc quá thời gian chờ – UC-08):**<br>6a. Dịch vụ thanh toán từ chối, hoặc không phản hồi trong thời gian quy định.<br>6b. Hệ thống chuyển đơn sang `PAYMENT_FAILED`, không cộng điểm, không làm trống giỏ hàng và thông báo cho quản trị viên.<br>6c. Hệ thống báo lỗi thanh toán bằng tiếng Việt, nêu nguyên nhân và gợi ý khách thử lại hoặc đổi phương thức.<br>6d. Nếu chưa biết giao dịch đã thành công hay chưa (do quá thời gian chờ), hệ thống kiểm tra lại với dịch vụ thanh toán trước khi cho khách thử lại, để không tính tiền hai lần.<br>6e. Khi khách thử lại, hệ thống xử lý như một lần thanh toán mới, bắt đầu lại từ bước 1.<br><br>**Exception 2 – at step 3 (khách bấm thanh toán nhiều lần):**<br>3a. Nếu lần thanh toán trước đã có kết quả, hệ thống không xử lý lại mà hiển thị đúng kết quả đó cho khách.<br>3b. Nếu lần thanh toán trước vẫn đang xử lý, hệ thống thông báo giao dịch đang được xử lý, đề nghị khách chờ và không bấm lại.<br>3c. Hệ thống không bao giờ gửi hai yêu cầu trừ tiền cho cùng một lần thanh toán.<br><br>**Exception 3 – at step 2 (chưa đăng nhập, phiên hết hạn hoặc sai quyền):**<br>2a. Nếu chưa đăng nhập hoặc phiên đăng nhập hết hạn, hệ thống từ chối và yêu cầu khách đăng nhập.<br>2b. Nếu đơn không phải của khách, hệ thống từ chối và không hiển thị thông tin đơn.<br><br>**Exception 4 – at step 4 (đơn không thể thanh toán):**<br>4a. Nếu đơn đang ở trạng thái `PAID`, hệ thống từ chối và báo đơn đã được thanh toán.<br>4b. Nếu đơn đang ở trạng thái `CANCELLED` hoặc `COMPLETED`, hệ thống từ chối và báo đơn không thể thanh toán.<br><br>**Exception 5 – at step 4 (phương thức hoặc số tiền không hợp lệ):**<br>4c. Nếu khách chưa chọn phương thức hoặc chọn phương thức không được hỗ trợ, hệ thống yêu cầu chọn Ví hoặc Thẻ.<br>4d. Nếu số tiền thanh toán thấp hơn số tiền phải trả, hệ thống từ chối giao dịch.<br><br>**Exception 6 – at step 7 (đơn vừa bị thay đổi):**<br>7a. Nếu trong lúc thanh toán, quản trị viên vừa hủy đơn, hệ thống hủy bỏ tiến trình, không lưu thay đổi và báo khách đơn đã bị thay đổi. |
+| **Alternative Flows** | **Alternative 1 – at step 1 (khách đổi phương thức):**<br>1a. Khách đổi giữa Ví và Thẻ trước khi xác nhận. Luồng tiếp tục bình thường.<br><br>**Alternative 2 – at step 1 (thanh toán lại từ "Đơn của tôi" – UC-08):**<br>1b. Khách có thể thanh toán lại bằng cách vào "Đơn của tôi" (Lịch sử đơn hàng), mở đơn đang `PENDING` hoặc `PAYMENT_FAILED` và bấm "Thanh toán lại" (kích hoạt UC-08). Luồng bắt đầu từ bước 1. |
+| **Requirements** | FR-06; NFR-02, NFR-05; AC-06.1 → AC-06.13 (trong đó AC-06.5, AC-06.6 thuộc UC-08), AC-07.7, AC-N05.3 |
+
+## 5. Máy trạng thái đơn hàng (State Machine)
+
+Tên trạng thái trong mã nguồn đối chiếu với tên trong SRS (Mục 3):
+
+| Mã trạng thái | Tên trong SRS |
+|---|---|
+| `PENDING` | Chờ thanh toán |
+| `PAYMENT_FAILED` | Thanh toán thất bại |
+| `PAID` | Đã thanh toán |
+| `PREPARING` | Đang pha chế |
+| `READY` | Sẵn sàng |
+| `COMPLETED` | Hoàn tất |
+| `CANCELLED` | Đã hủy |
+
+**Bảng chuyển trạng thái:**
+
+| Từ trạng thái | Sang trạng thái | Điều kiện / Tác nhân | Hệ quả |
+|---|---|---|---|
+| (tạo mới) | `PENDING` | UC-05 thành công | Trừ kho, tăng lượt dùng mã |
+| `PENDING` | `PAID` | Payment Service báo thành công | Cộng điểm, làm trống giỏ |
+| `PENDING` | `PAYMENT_FAILED` | Payment lỗi hoặc timeout | Không cộng điểm |
+| `PAYMENT_FAILED` | `PENDING` | Khách thanh toán lại | Bắt đầu lần thanh toán mới |
+| `PAYMENT_FAILED` | `PAID` | Khách thanh toán lại và Payment báo thành công | Cộng điểm, làm trống giỏ (AC-06.1, AC-06.6) |
+| `PENDING`, `PAYMENT_FAILED` | `CANCELLED` | Admin hủy | Hoàn kho, hoàn lượt dùng mã |
+| `PENDING`, `PAYMENT_FAILED` | `CANCELLED` | **Tự động hủy đơn:** hệ thống (System) tự hủy khi đơn quá thời hạn thanh toán quy định mà chưa chuyển sang `PAID` | Hoàn kho, hoàn lượt dùng mã |
+| `PAID` | `CANCELLED` | Admin hủy khi chưa pha chế | Hoàn kho, hoàn mã, **thu hồi điểm** |
+
+- **Chuyển trạng thái không hợp lệ** (ví dụ `PAID → PAYMENT_FAILED`, `CANCELLED → PAID`) bị từ chối, trạng thái giữ nguyên.
+- Mọi lần chuyển trạng thái được ghi lại (thời gian, người/hệ thống thực hiện) để tra cứu.
+- **`PENDING` là trạng thái vi mô (transient state):** xảy ra ngay sau khi khách bấm Đặt đơn và kéo dài trong lúc hệ thống chờ phản hồi từ Payment Service. Nếu khách tắt app giữa chừng, hệ thống vẫn giữ đơn ở trạng thái này để khách có thể vào "Đơn của tôi" thanh toán tiếp (UC-08). Cách hiểu này giải thích vì sao UC-05 vẫn `<<include>>` UC-07 nhưng đơn vẫn có một trạng thái chờ.
+- **Tự động hủy đơn:** chỉ áp dụng cho đơn chưa thanh toán (`PENDING`, `PAYMENT_FAILED`). Đơn đã `PAID` không bị hệ thống tự hủy; muốn hủy phải do Admin thực hiện theo điều kiện ở bảng trên. Kết quả hoàn kho và hoàn lượt dùng mã giống trường hợp Admin hủy; lịch sử chuyển trạng thái ghi tác nhân là hệ thống (System).
+- Các trạng thái sau `PAID` (`PREPARING`, `READY`, `COMPLETED`) thuộc FR-08, ngoài phạm vi tài liệu này. Đơn đã `PREPARING` trở đi thì Admin không được hủy (AC-08.9).
+
+## 6. Truy vết yêu cầu và tiêu chí chấp nhận
+
+**Bảng kịch bản kiểm thử:**
+
+| Kịch bản kiểm thử | Mã AC | Kết quả mong đợi |
+|---|---|---|
+| Đặt đơn hợp lệ, đủ hàng | AC-05.1, 05.3 | Đơn `PENDING`, kho giảm đúng |
+| Giá tính từ DB, không tin client | AC-05.2 | Số tiền theo giá hiện hành |
+| Món không đủ số lượng | AC-05.4 | `409`, từ chối cả đơn, không món nào bị trừ kho |
+| Món / size / topping ngừng phục vụ, giỏ trống | AC-05.5, 05.6, 05.7 | Từ chối, nêu rõ lựa chọn không hợp lệ |
+| Hai khách cùng đặt món còn 1 phần | AC-05.13, N05.2 | Một thành công, một `409`; kho = 0 |
+| Tài khoản bị khóa đặt đơn | AC-05.14 | Từ chối đặt đơn |
+| Quản trị viên nhận thông báo đơn mới | AC-05.15 | Có thông báo đơn mới |
+| Hiển thị điểm dự kiến khi đặt đơn | AC-05.16 | 1 điểm / 10.000đ, tính theo phần nguyên |
+| Áp mã giảm giá hợp lệ / có trần | AC-05.8, 05.9, 05.10 | Tiền giảm đúng, không vượt trần/tổng tiền |
+| Mã không dùng được | AC-05.11 | Báo rõ lý do, không giảm giá |
+| Đơn có mã được tạo | AC-05.12 | Lượt dùng mã tăng 1 |
+| Tạo đơn bị gián đoạn giữa chừng | AC-N05.1 | Không đơn dở dang, kho không trừ sai |
+| Thanh toán thành công | AC-06.1, 06.2, 06.3, 06.4 | `PAID`, cộng điểm, giỏ trống, Admin thấy đơn chờ pha chế |
+| Thanh toán thất bại | AC-06.5, 06.13 | `PAYMENT_FAILED`, không cộng điểm, Admin nhận thông báo |
+| Thử lại sau thất bại | AC-06.6, 07.7 | Thanh toán mới, có thể thành `PAID` |
+| Bấm xác nhận nhiều lần cùng key | AC-06.7, N05.3 | Chỉ 1 giao dịch, cùng kết quả |
+| Thanh toán đơn đã `PAID` | AC-06.8 | Từ chối, báo đơn đã được thanh toán |
+| Thanh toán đơn `CANCELLED` / `COMPLETED` | AC-06.9 | Từ chối, báo đơn không thể thanh toán |
+| Số tiền thấp hơn số tiền phải trả | AC-06.10 | Từ chối giao dịch |
+| Chưa chọn / chọn sai phương thức | AC-06.11 | Yêu cầu chọn Ví hoặc Thẻ |
+| Thanh toán đơn của người khác | AC-06.12, N02.2 | `403` |
+
+**Bảng truy vết use-case:**
+
+| Use-case | Yêu cầu chức năng | Yêu cầu phi chức năng |
+|---|---|---|
+| UC-05 Đặt đơn hàng | FR-05 | NFR-02, NFR-05 |
+| UC-06 Áp dụng mã giảm giá | FR-05 | NFR-05 |
+| UC-07 Thanh toán đơn hàng | FR-06 | NFR-02, NFR-05 |
+| UC-08 Thử lại thanh toán | FR-06 | NFR-05 |
+
+
+==================== FILE: apps\web\src\contexts\AuthContext.tsx ====================
+"use client";
+
+import {
+    createContext,
+    useContext,
+    useEffect,
+    useState,
+    type ReactNode,
+} from "react";
+
+export interface AuthUser {
+    id?: number;
+    email: string;
+    name?: string | null;
+    role?: string;
+}
+
+type AuthContextValue = {
+    isAuthenticated: boolean;
+    isLoading: boolean;
+    user: AuthUser | null;
+    login: (token: string, userData?: AuthUser) => void;
+    logout: () => void;
+};
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+function parseJwt(token: string): any {
+    try {
+        const base64Url = token.split(".")[1];
+        if (!base64Url) return null;
+        const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+        return JSON.parse(window.atob(base64));
+    } catch {
+        return null;
+    }
+}
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+    const [token, setToken] = useState<string | null>(null);
+    const [user, setUser] = useState<AuthUser | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
+
+    useEffect(() => {
+        const savedToken = localStorage.getItem("token");
+        const savedUser = localStorage.getItem("user");
+
+        if (savedToken) {
+            const decoded = parseJwt(savedToken);
+            // Kiểm tra xem Token có hợp lệ và còn hạn sử dụng không (exp tính bằng giây)
+            if (!decoded || (decoded.exp && decoded.exp * 1000 < Date.now())) {
+                // Nếu hết hạn -> Xóa sạch
+                localStorage.removeItem("token");
+                localStorage.removeItem("user");
+                setToken(null);
+                setUser(null);
+            } else {
+                // Nếu còn hạn -> Cho phép đăng nhập
+                setToken(savedToken);
+                if (savedUser) {
+                    try {
+                        setUser(JSON.parse(savedUser));
+                    } catch {
+                        setUser(null);
+                    }
+                } else {
+                    setUser({
+                        id: decoded.sub || decoded.id,
+                        email: decoded.email || "admin@brewlite.com",
+                        name: decoded.name || "Admin",
+                        role: decoded.role || "ADMIN",
+                    });
+                }
+            }
+        }
+        setIsLoading(false);
+    }, []);
+
+    const login = (t: string, userData?: AuthUser) => {
+        localStorage.setItem("token", t);
+        setToken(t);
+
+        let finalUser = userData;
+        if (!finalUser) {
+            const decoded = parseJwt(t);
+            if (decoded) {
+                finalUser = {
+                    id: decoded.sub || decoded.id,
+                    email: decoded.email || "admin@brewlite.com",
+                    name: decoded.name || "Admin",
+                    role: decoded.role || "ADMIN",
+                };
+            }
+        }
+
+        if (finalUser) {
+            localStorage.setItem("user", JSON.stringify(finalUser));
+            setUser(finalUser);
+        }
+    };
+
+    const logout = () => {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        setToken(null);
+        setUser(null);
+    };
+
+    return (
+        <AuthContext.Provider
+            value={{ isAuthenticated: !!token, isLoading, user, login, logout }}
+        >
+            {children}
+        </AuthContext.Provider>
+    );
+}
+
+export function useAuth() {
+    const ctx = useContext(AuthContext);
+    if (!ctx) throw new Error("useAuth must be used inside <AuthProvider>");
+    return ctx;
+}
+
+
+==================== FILE: apps\web\src\contexts\CartContext.tsx ====================
+"use client";
+
+import {
+    createContext, useCallback, useContext, useEffect, useMemo, useReducer, useState,
+    type ReactNode,
+} from "react";
+import { CART_STORAGE_KEY, calcUnitPrice, lineTotal, makeCartKey, type CartItem, type CartTopping } from "@/lib/shop";
+
+
+type Action =
+    | { type: "HYDRATE"; items: CartItem[] }
+    | { type: "ADD"; item: CartItem }
+    | { type: "SET_QTY"; key: string; qty: number }
+    | { type: "REMOVE"; key: string }
+    | { type: "UPDATE_LINE"; key: string; count: number; next: LineOptions }
+    | { type: "CLEAR" };
+
+export interface LineOptions {
+    sizeName: string | null;
+    sizeSurcharge: number;
+    toppings: CartTopping[];
+}
+
+function reducer(items: CartItem[], a: Action): CartItem[] {
+    switch (a.type) {
+        case "HYDRATE":
+            return a.items;
+        case "ADD": {
+            const found = items.find((i) => i.key === a.item.key);
+            if (!found) return [...items, { ...a.item, qty: Math.min(a.item.qty, a.item.maxQty) }];
+            return items.map((i) =>
+                i.key === a.item.key ? { ...i, qty: Math.min(i.qty + a.item.qty, i.maxQty) } : i
+            );
+        }
+        case "SET_QTY":
+            return a.qty <= 0
+                ? items.filter((i) => i.key !== a.key)
+                : items.map((i) => (i.key === a.key ? { ...i, qty: Math.min(a.qty, i.maxQty) } : i));
+        case "REMOVE":
+            return items.filter((i) => i.key !== a.key);
+        case "UPDATE_LINE": {
+            const idx = items.findIndex((i) => i.key === a.key);
+            if (idx < 0) return items;
+            const line = items[idx];
+            const newKey = makeCartKey(line.productId, a.next.sizeName, a.next.toppings);
+            if (newKey === line.key) return items;
+
+            // Tách `count` ly ra khỏi dòng cũ (xóa dòng nếu tách hết)
+            const count = Math.min(Math.max(1, a.count), line.qty);
+            const rest = line.qty - count;
+            const without = rest > 0
+                ? items.map((i, n) => (n === idx ? { ...i, qty: rest } : i))
+                : items.filter((_, n) => n !== idx);
+
+            // Gộp vào dòng đã có cùng cấu hình, nếu không thì chèn dòng mới ngay sau dòng cũ
+            if (without.some((i) => i.key === newKey)) {
+                return without.map((i) => (i.key === newKey ? { ...i, qty: Math.min(i.qty + count, i.maxQty) } : i));
+            }
+            const moved: CartItem = {
+                ...line, ...a.next, key: newKey, qty: count,
+                unitPrice: calcUnitPrice(line.basePrice, a.next.sizeSurcharge, a.next.toppings),
+            };
+            const pos = rest > 0 ? idx + 1 : idx;
+            return [...without.slice(0, pos), moved, ...without.slice(pos)];
+        }
+        case "CLEAR":
+            return [];
+    }
+}
+
+export type AddItemInput = Omit<CartItem, "key">;
+
+interface CartContextValue {
+    items: CartItem[];
+    totalQty: number;
+    totalPrice: number;
+    hydrated: boolean;
+    addItem: (input: AddItemInput) => void;
+    increase: (key: string) => void;
+    decrease: (key: string) => void;
+    remove: (key: string) => void;
+    /** Đổi size/topping của `count` ly trong một dòng (tách dòng nếu cần). */
+    updateLine: (key: string, count: number, next: LineOptions) => void;
+    /** Gọi sau khi thanh toán thành công. */
+    clearCart: () => void;
+}
+
+const CartContext = createContext<CartContextValue | null>(null);
+
+export function CartProvider({ children }: { children: ReactNode }) {
+    const [items, dispatch] = useReducer(reducer, []);
+    const [hydrated, setHydrated] = useState(false);
+
+    // Nạp localStorage sau khi mount để tránh lỗi hydration mismatch
+    useEffect(() => {
+        try {
+            const raw = localStorage.getItem(CART_STORAGE_KEY);
+            const parsed = raw ? JSON.parse(raw) : [];
+            if (Array.isArray(parsed)) dispatch({ type: "HYDRATE", items: parsed });
+        } catch {
+            /* dữ liệu hỏng: bỏ qua */
+        }
+        setHydrated(true);
+    }, []);
+
+    useEffect(() => {
+        if (hydrated) localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(items));
+    }, [items, hydrated]);
+
+    const addItem = useCallback(
+        (input: AddItemInput) =>
+            dispatch({
+                type: "ADD",
+                item: { ...input, key: makeCartKey(input.productId, input.sizeName, input.toppings) },
+            }),
+        []
+    );
+
+    const value = useMemo<CartContextValue>(() => {
+        const step = (key: string, delta: number) => {
+            const cur = items.find((i) => i.key === key);
+            if (cur) dispatch({ type: "SET_QTY", key, qty: cur.qty + delta });
+        };
+        return {
+            items,
+            hydrated,
+            totalQty: items.reduce((s, i) => s + i.qty, 0),
+            totalPrice: items.reduce((s, i) => s + lineTotal(i), 0),
+            addItem,
+            increase: (key) => step(key, 1),
+            decrease: (key) => step(key, -1),
+            remove: (key) => dispatch({ type: "REMOVE", key }),
+            updateLine: (key, count, next) => dispatch({ type: "UPDATE_LINE", key, count, next }),
+            clearCart: () => dispatch({ type: "CLEAR" }),
+        };
+    }, [items, hydrated, addItem]);
+
+    return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
+}
+
+export function useCart() {
+    const ctx = useContext(CartContext);
+    if (!ctx) throw new Error("useCart must be used inside <CartProvider>");
+    return ctx;
+}
+
+
+
+==================== FILE: apps\web\src\lib\api.ts ====================
+export const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+
+/**
+ * Chuyển đổi đường dẫn ảnh tương đối từ Backend (VD: /uploads/abc.jpg)
+ * thành đường dẫn đầy đủ (http://localhost:3001/uploads/abc.jpg)
+ */
+export function getImageUrl(url?: string | null): string | undefined {
+    if (!url) return undefined;
+    if (
+        url.startsWith("http://") ||
+        url.startsWith("https://") ||
+        url.startsWith("data:") ||
+        url.startsWith("blob:")
+    ) {
+        return url;
+    }
+    // Ảnh được serve ở /uploads (không nằm dưới tiền tố /api) nên phải cắt /api khỏi BASE_URL
+    const host = BASE_URL.replace(/\/api\/?$/, "");
+    return `${host}${url.startsWith("/") ? "" : "/"}${url}`;
+}
+
+export async function apiFetch<T>(
+    endpoint: string,
+    options: RequestInit = {}
+): Promise<T> {
+    const token =
+        typeof window !== "undefined" ? localStorage.getItem("token") : null;
+
+    // Kiểm tra nếu body là FormData (dùng khi upload file ảnh)
+    // thì KHÔNG gắn cứng "Content-Type": "application/json" để trình duyệt tự gắn boundary
+    const isFormData =
+        typeof FormData !== "undefined" && options.body instanceof FormData;
+
+    const res = await fetch(`${BASE_URL}${endpoint}`, {
+        ...options,
+        headers: {
+            ...(isFormData ? {} : { "Content-Type": "application/json" }),
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            ...options.headers,
+        },
+    });
+
+    const json = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+        const errorMsg = Array.isArray(json.message)
+            ? json.message[0]
+            : json.message || json.error;
+        throw new Error(errorMsg || `API Error (${res.status})`);
+    }
+
+    // Tự động lấy phần .data nếu Backend dùng TransformInterceptor bọc dữ liệu
+    return (json.data !== undefined ? json.data : json) as T;
+}
+
+
+==================== FILE: apps\web\src\lib\mockData.ts ====================
+import type { Category, Topping, Product, Coupon, User, Order } from './types';
+
+export const MOCK_CATEGORIES: Category[] = [
+    { id: 1, name: 'Coffee', description: 'Espresso-based drinks', color: '#B45309', productCount: 3, createdAt: '2026-01-10T00:00:00Z', updatedAt: '2026-01-10T00:00:00Z', isActive: true },
+    { id: 2, name: 'Tea', description: 'Premium loose leaf teas', color: '#059669', productCount: 3, createdAt: '2026-01-10T00:00:00Z', updatedAt: '2026-01-10T00:00:00Z', isActive: true },
+    { id: 3, name: 'Smoothies', description: 'Fresh blended fruit smoothies', color: '#7C3AED', productCount: 3, createdAt: '2026-01-12T00:00:00Z', updatedAt: '2026-01-12T00:00:00Z', isActive: true },
+];
+
+export const MOCK_TOPPINGS: Topping[] = [
+    { id: 1, name: 'Pearl (Boba)', price: 10000, isAvailable: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    { id: 2, name: 'Cheese Foam', price: 15000, isAvailable: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    { id: 3, name: 'Espresso Shot', price: 10000, isAvailable: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+];
+
+export const MOCK_PRODUCTS: Product[] = [
+    {
+        id: 1, name: 'Caramel Latte', categoryId: 1, price: 35000,
+        description: 'Smooth espresso with steamed milk and caramel sauce',
+        sizes: [
+            { id: 1, name: 'Small', surcharge: 0, isAvailable: true },
+            { id: 2, name: 'Medium', surcharge: 10000, isAvailable: true },
+            { id: 3, name: 'Large', surcharge: 20000, isAvailable: true }
+        ],
+        stock: 48, version: 1, isActive: true, createdAt: '2026-01-15T00:00:00Z', updatedAt: '2026-01-15T00:00:00Z',
+    },
+    {
+        id: 2, name: 'Classic Milk Tea', categoryId: 2, price: 30000,
+        description: 'Traditional milk tea with rich black tea blend',
+        sizes: [
+            { id: 4, name: 'Small', surcharge: 0, isAvailable: true },
+            { id: 5, name: 'Large', surcharge: 10000, isAvailable: true }
+        ],
+        stock: 60, version: 1, isActive: true, createdAt: '2026-01-20T00:00:00Z', updatedAt: '2026-01-20T00:00:00Z',
+    },
+];
+
+export const MOCK_COUPONS: Coupon[] = [
+    { id: 1, code: 'WELCOME10', type: 'PERCENT', value: 10, minOrderValue: 30000, maxDiscount: 20000, expiresAt: '2027-11-01T00:00:00Z', startsAt: '2026-01-01T00:00:00Z', usageLimit: 100, usedCount: 23, isActive: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    { id: 2, code: 'FLAT5K', type: 'FIXED', value: 5000, minOrderValue: 20000, expiresAt: '2027-10-31T00:00:00Z', startsAt: '2026-01-01T00:00:00Z', usedCount: 41, isActive: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+];
+
+export const MOCK_USERS: User[] = [
+    { id: 1, name: 'Quản Trị Viên', email: 'admin@brewlite.com', role: 'ADMIN', loyaltyPoints: 0, isActive: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    { id: 2, name: 'Alice Brown', email: 'alice@email.com', role: 'CUSTOMER', loyaltyPoints: 895, isActive: true, createdAt: '2026-02-10T00:00:00Z', updatedAt: '2026-02-10T00:00:00Z', totalOrders: 12, totalSpent: 895000 },
+];
+
+export const MOCK_ORDERS: Order[] = [
+    {
+        id: 1, userId: 2,
+        items: [
+            { id: 1, productId: 1, productName: 'Caramel Latte', sizeName: 'Large', sizeSurcharge: 20000, toppings: [{ id: 1, toppingId: 1, toppingName: 'Pearl (Boba)', price: 10000 }], qty: 2, unitPrice: 35000, lineTotal: 130000 }
+        ],
+        discountAmount: 13000, total: 117000, status: 'COMPLETED', couponId: 1, discountCode: 'WELCOME10', loyaltyPointsEarned: 11, createdAt: '2026-10-01T08:30:00Z', updatedAt: '2026-10-01T09:00:00Z',
+    },
+    {
+        id: 2, userId: 2,
+        items: [
+            { id: 2, productId: 2, productName: 'Classic Milk Tea', sizeName: 'Small', sizeSurcharge: 0, toppings: [], qty: 1, unitPrice: 30000, lineTotal: 30000 }
+        ],
+        discountAmount: 0, total: 30000, status: 'PENDING', loyaltyPointsEarned: 0, createdAt: '2026-10-04T09:15:00Z', updatedAt: '2026-10-04T09:45:00Z',
+    }
+];
+
+export const CHART_REVENUE_7DAYS = [
+    { day: 'Sep 28', revenue: 1425000 }, { day: 'Sep 29', revenue: 1987500 }, { day: 'Sep 30', revenue: 1672500 },
+    { day: 'Oct 1', revenue: 2238000 }, { day: 'Oct 2', revenue: 1895000 }, { day: 'Oct 3', revenue: 2564000 }, { day: 'Oct 4', revenue: 1782000 },
+];
+
+export const CHART_REVENUE_6MONTHS = [
+    { month: 'May', revenue: 38400000 }, { month: 'Jun', revenue: 42100000 }, { month: 'Jul', revenue: 56800000 },
+    { month: 'Aug', revenue: 49200000 }, { month: 'Sep', revenue: 63400000 }, { month: 'Oct', revenue: 38200000 },
+];
+
+export const CHART_TOP_PRODUCTS = [
+    { name: 'Classic Milk Tea', revenue: 12400000 }, { name: 'Caramel Latte', revenue: 9800000 },
+];
+
+
+==================== FILE: apps\web\src\lib\orderStatus.ts ====================
+import type { Order, OrderStatus } from './types';
+
+// UI groups shown in sidebar, cards and tabs
+export type OrderStatusGroup = 'received' | 'processing' | 'completed' | 'canceled';
+export type OrderFilter = OrderStatusGroup | 'all';
+
+export const ORDER_STATUSES: readonly OrderStatus[] = [
+    'PENDING', 'PAID', 'PREPARING', 'READY', 'COMPLETED', 'PAYMENT_FAILED', 'CANCELLED',
+] as const;
+
+export const GROUP_TO_STATUSES: Record<OrderStatusGroup, readonly OrderStatus[]> = {
+    received: ['PENDING', 'PAID'],
+    processing: ['PREPARING', 'READY'],
+    completed: ['COMPLETED'],
+    canceled: ['CANCELLED', 'PAYMENT_FAILED'],
+};
+
+export const STATUS_TO_GROUP: Record<OrderStatus, OrderStatusGroup> = {
+    PENDING: 'received',
+    PAID: 'received',
+    PREPARING: 'processing',
+    READY: 'processing',
+    COMPLETED: 'completed',
+    CANCELLED: 'canceled',
+    PAYMENT_FAILED: 'canceled',
+};
+
+export const GROUPS: readonly OrderStatusGroup[] = ['received', 'processing', 'completed', 'canceled'];
+export const FILTERS: readonly OrderFilter[] = ['all', ...GROUPS];
+
+export function matchesFilter(status: OrderStatus, filter: OrderFilter): boolean {
+    return filter === 'all' || STATUS_TO_GROUP[status] === filter;
+}
+
+export function countByFilter(orders: Pick<Order, 'status'>[], filter: OrderFilter): number {
+    return orders.filter((o) => matchesFilter(o.status, filter)).length;
+}
+
+export function filterToPath(filter: OrderFilter): string {
+    return `/orders/${filter}`;
+}
+
+export function pathToFilter(pathname: string): OrderFilter {
+    const last = pathname.replace(/\/+$/, '').split('/').pop();
+    return (FILTERS as readonly string[]).includes(last ?? '') && pathname.startsWith('/orders')
+        ? (last as OrderFilter)
+        : 'all';
+}
+
+
+
+==================== FILE: apps\web\src\lib\shop.ts ====================
+import type { Product, ProductSize } from "@/lib/types";
+
+export interface CartTopping {
+    id: number;
+    name: string;
+    price: number;
+}
+
+export interface CartItem {
+    key: string;
+    productId: number;
+    name: string;
+    imageUrl?: string | null;
+    sizeName: string | null; 
+    sizeSurcharge: number;
+    toppings: CartTopping[];
+    qty: number;
+    basePrice: number;
+    unitPrice: number; 
+    maxQty: number; 
+}
+
+export const calcUnitPrice = (basePrice: number, sizeSurcharge: number, toppings: CartTopping[]) =>
+    Number(basePrice) + sizeSurcharge + toppings.reduce((s, t) => s + Number(t.price), 0);
+
+export const lineTotal = (i: Pick<CartItem, "unitPrice" | "qty">) => i.unitPrice * i.qty;
+
+export const makeCartKey = (productId: number, sizeName: string | null, toppings: CartTopping[]) =>
+    [productId, sizeName ?? "-", ...toppings.map((t) => t.id).sort((a, b) => a - b)].join("|");
+
+export const formatVND = (n: number) => `${Number(n).toLocaleString("vi-VN")}đ`;
+
+export const normalize = (s: string) =>
+    s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").toLowerCase().trim();
+
+export const LOGIN_PATH = "/auth/login";
+export const CHECKOUT_PATH = "/shop/checkout";
+
+
+export function matchesSearch(p: Product, query: string): boolean {
+    const tokens = normalize(query).split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return true;
+    const words = normalize(`${p.name} ${p.category?.name ?? ""}`).split(/\s+/);
+    return tokens.every((t) => words.some((w) => w.startsWith(t)));
+}
+
+export const CART_STORAGE_KEY = "brewlite_cart_v1";
+export const CART_OWNER_KEY = "brewlite_cart_owner";
+
+export function claimCartForUser(email: string) {
+    try {
+        const owner = localStorage.getItem(CART_OWNER_KEY);
+        if (owner && owner !== email) localStorage.removeItem(CART_STORAGE_KEY);
+        localStorage.setItem(CART_OWNER_KEY, email);
+    } catch {  }
+}
+
+
+export function releaseCartOwner() {
+    try { localStorage.removeItem(CART_OWNER_KEY); } catch {  }
+}
+
+export const sortedSizes = (p: Product): ProductSize[] =>
+    [...(p.sizes ?? [])].filter((s) => s.isAvailable !== false).sort((a, b) => a.surcharge - b.surcharge);
+
+
+export const toOrderItems = (items: CartItem[]) =>
+    items.map((i) => ({
+        productId: i.productId,
+        ...(i.sizeName ? { size: i.sizeName } : {}),
+        quantity: i.qty,
+        toppingIds: i.toppings.map((t) => t.id),
+    }));
+
+
+
+==================== FILE: apps\web\src\lib\types.ts ====================
+export type UserRole = 'ADMIN' | 'CUSTOMER';
+export type OrderStatus =
+    | 'PENDING'
+    | 'PAID'
+    | 'PREPARING'
+    | 'READY'
+    | 'COMPLETED'
+    | 'PAYMENT_FAILED'
+    | 'CANCELLED';
+export type DiscountType = 'PERCENT' | 'FIXED';
+export type PaymentMethod = 'WALLET' | 'CARD';
+export type PaymentStatus = 'SUCCESS' | 'FAILED';
+
+export interface Category {
+    id: number;
+    name: string;
+    description?: string | null;
+    imageUrl?: string | null;
+    isActive: boolean;
+    createdAt: string;
+    updatedAt: string;
+    // Dành cho hiển thị UI (Dữ liệu tính toán từ backend)
+    productCount?: number;
+    color?: string; // Giữ lại cho Figma render nếu cần
+}
+
+export interface Topping {
+    id: number;
+    name: string;
+    price: number;
+    imageUrl?: string | null;
+    isAvailable: boolean;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface ProductSize {
+    id: number;
+    name: string;
+    surcharge: number;
+    isAvailable: boolean;
+}
+
+export interface Product {
+    id: number;
+    name: string;
+    price: number;
+    description?: string | null;
+    categoryId?: number | null;
+    category?: Category; // Quan hệ
+    sizes: ProductSize[];
+    imageUrl?: string | null;
+    stock: number;
+    version: number;
+    isActive: boolean;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface Coupon {
+    id: number;
+    code: string;
+    type: DiscountType;
+    value: number;
+    minOrderValue: number;
+    maxDiscount?: number | null;
+    usageLimit?: number | null;
+    usedCount: number;
+    startsAt: string;
+    expiresAt: string;
+    isActive: boolean;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface User {
+    id: number;
+    email: string;
+    name?: string | null;
+    phone?: string | null;
+    gender?: string | null;
+    role: UserRole;
+    loyaltyPoints: number;
+    isActive: boolean;
+    createdAt: string;
+    updatedAt: string;
+    // Dành cho UI Dashboard
+    totalOrders?: number;
+    totalSpent?: number;
+}
+
+export interface OrderItemTopping {
+    id: number;
+    toppingId: number;
+    toppingName: string;
+    price: number;
+}
+
+export interface OrderItem {
+    id: number;
+    productId: number;
+    productSizeId?: number | null;
+    productName: string;
+    unitPrice: number;
+    sizeName?: string | null;
+    sizeSurcharge: number;
+    qty: number;
+    lineTotal: number;
+    toppings: OrderItemTopping[];
+}
+
+export interface Order {
+    id: number;
+    userId: number;
+    user?: User; // Quan hệ
+    couponId?: number | null;
+    status: OrderStatus;
+    total: number;
+    discountCode?: string | null;
+    discountAmount: number;
+    loyaltyPointsEarned: number;
+    items: OrderItem[]; // Prisma gọi là orderItems
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface AuthUser {
+    id: number;
+    name?: string | null;
+    email: string;
+    role: UserRole;
+}
+
+

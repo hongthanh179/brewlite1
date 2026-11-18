@@ -1,0 +1,2373 @@
+﻿
+==================== FILE: apps\api\prisma\schema.prisma ====================
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------
+
+enum OrderStatus {
+  PENDING
+  PAID
+  PREPARING
+  READY
+  COMPLETED
+  PAYMENT_FAILED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  WALLET
+  CARD
+}
+
+enum PaymentStatus {
+  SUCCESS
+  FAILED
+}
+
+enum Role {
+  CUSTOMER
+  ADMIN
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+enum NotificationType {
+  ORDER_NEW // Có đơn mới
+  ORDER_UPDATE // Đơn đã thanh toán / đổi trạng thái
+  PAYMENT_FAILED // Thanh toán thất bại
+  ORDER_CANCELLED // Đơn bị huỷ
+  LOW_STOCK // Sắp hết hàng
+  OUT_OF_STOCK // Hết hàng
+}
+
+enum NotificationAudience {
+  ADMIN
+  CUSTOMER
+}
+
+// ---------------------------------------------------------
+// MODELS
+// ---------------------------------------------------------
+
+model User {
+  id            Int     @id @default(autoincrement())
+  email         String  @unique
+  passwordHash  String
+  name          String?
+  phone         String? @unique
+  gender        String?
+  loyaltyPoints Int     @default(0)
+  role          Role    @default(CUSTOMER)
+  isActive      Boolean @default(true)
+
+  orders        Order[]
+  notifications Notification[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Category {
+  id          Int     @id @default(autoincrement())
+  name        String  @unique
+  description String?
+  imageUrl    String?
+  isActive    Boolean @default(true)
+
+  products Product[]
+  toppings Topping[] @relation("CategoryToppings") // Quan hệ nhiều - nhiều: Danh mục liên kết các loại Topping phù hợp
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Product {
+  id          Int     @id @default(autoincrement())
+  name        String
+  price       Int // Số nguyên VNĐ
+  imageUrl    String?
+  description String? @db.Text
+  stock       Int
+  version     Int     @default(1) // Khóa lạc quan (Optimistic Locking Task 10)
+  isActive    Boolean @default(true)
+
+  categoryId Int?
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  sizes      ProductSize[]
+  orderItems OrderItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ProductSize {
+  id          Int     @id @default(autoincrement())
+  name        String
+  surcharge   Int // Phụ thu theo VNĐ
+  isAvailable Boolean @default(true)
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  orderItems OrderItem[]
+
+  @@unique([productId, name])
+}
+
+model Topping {
+  id          Int     @id @default(autoincrement())
+  name        String  @unique
+  price       Int // Số nguyên VNĐ
+  imageUrl    String?
+  isAvailable Boolean @default(true)
+
+  categories        Category[]         @relation("CategoryToppings") // Quan hệ nhiều - nhiều với Category
+  orderItemToppings OrderItemTopping[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Coupon {
+  id            Int          @id @default(autoincrement())
+  code          String       @unique
+  type          DiscountType
+  value         Int
+  minOrderValue Int
+  maxDiscount   Int?
+  usageLimit    Int?
+  usedCount     Int          @default(0)
+  startsAt      DateTime
+  expiresAt     DateTime
+  isActive      Boolean      @default(true)
+
+  orders Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Order {
+  id                  Int         @id @default(autoincrement())
+  userId              Int
+  couponId            Int?
+  status              OrderStatus @default(PENDING)
+  total               Int // Tổng tiền gốc trước giảm giá
+  discountCode        String?
+  discountAmount      Int         @default(0)
+  finalAmount         Int // Tiền thực tế cần thanh toán
+  loyaltyPointsEarned Int         @default(0)
+
+  user       User        @relation(fields: [userId], references: [id])
+  coupon     Coupon?     @relation(fields: [couponId], references: [id])
+  orderItems OrderItem[]
+  payments   Payment[] // Quan hệ 1 - N để cho phép thử lại thanh toán khi thất bại
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model OrderItem {
+  id            Int  @id @default(autoincrement())
+  orderId       Int
+  productId     Int
+  productSizeId Int?
+
+  // Snapshot giá trị sản phẩm tại thời điểm đặt hàng
+  productName   String
+  unitPrice     Int
+  sizeName      String?
+  sizeSurcharge Int     @default(0)
+
+  qty       Int
+  lineTotal Int
+
+  order    Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product  Product            @relation(fields: [productId], references: [id])
+  size     ProductSize?       @relation(fields: [productSizeId], references: [id])
+  toppings OrderItemTopping[]
+}
+
+model OrderItemTopping {
+  id          Int @id @default(autoincrement())
+  orderItemId Int
+  toppingId   Int
+
+  // Snapshot thông tin topping tại thời điểm đặt
+  toppingName String
+  price       Int
+  qty         Int    @default(1)
+  lineTotal   Int
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  topping   Topping   @relation(fields: [toppingId], references: [id])
+}
+
+model Payment {
+  id             Int           @id @default(autoincrement())
+  orderId        Int
+  idempotencyKey String        @unique // Khóa chống trùng lặp thanh toán (Task 10)
+  amount         Int
+  method         PaymentMethod
+  status         PaymentStatus @default(SUCCESS)
+  transactionId  String?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Notification {
+  id        Int                  @id @default(autoincrement())
+  audience  NotificationAudience @default(ADMIN)
+  userId    Int?
+  type      NotificationType
+  title     String
+  message   String               @db.VarChar(500)
+  href      String?
+  orderId   Int?
+  productId Int?
+  dedupeKey String?              @unique
+  isRead    Boolean              @default(false)
+  readAt    DateTime?
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([audience, isRead, createdAt])
+  @@index([userId, isRead])
+}
+
+
+
+==================== FILE: apps\api\prisma\seed.ts ====================
+import {
+  PrismaClient,
+  Role,
+  DiscountType,
+  OrderStatus,
+  PaymentMethod,
+  PaymentStatus,
+  NotificationAudience,
+  NotificationType,
+} from '@prisma/client';
+import type { Prisma, Coupon } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
+import { randomUUID } from 'crypto';
+
+const prisma = new PrismaClient();
+
+// ---------------------------------------------------------
+// Tiện ích: số giả ngẫu nhiên có seed cố định => mỗi lần nạp dữ liệu giống nhau
+// ---------------------------------------------------------
+let state = 42;
+const rand = () => {
+  state = (state * 1664525 + 1013904223) % 4294967296;
+  return state / 4294967296;
+};
+const randInt = (min: number, max: number) =>
+  min + Math.floor(rand() * (max - min + 1));
+const pick = <T>(arr: T[]): T => arr[Math.floor(rand() * arr.length)];
+const shuffle = <T>(arr: T[]): T[] => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+
+// Các trạng thái đã thanh toán thành công (đã trừ tồn kho, đã cộng điểm)
+const PAID_GROUP: OrderStatus[] = [
+  OrderStatus.PAID,
+  OrderStatus.PREPARING,
+  OrderStatus.READY,
+  OrderStatus.COMPLETED,
+];
+
+// Đơn tạo cách hiện tại bao nhiêu giờ (min, max) tùy trạng thái
+const AGE_HOURS: Record<OrderStatus, [number, number]> = {
+  [OrderStatus.COMPLETED]: [72, 336],
+  [OrderStatus.CANCELLED]: [24, 240],
+  [OrderStatus.PAID]: [0.2, 8],
+  [OrderStatus.PREPARING]: [0.2, 2],
+  [OrderStatus.READY]: [0.1, 1],
+  [OrderStatus.PENDING]: [0.05, 1],
+  [OrderStatus.PAYMENT_FAILED]: [0.1, 3],
+};
+
+// Phân bố khớp màn "Đơn hàng" của admin:
+// Tiếp nhận 27 | Đang xử lí 4 | Hoàn thành 9 | Đã huỷ 3  => Tất cả 43
+// + 1 đơn PENDING và 1 đơn PAYMENT_FAILED
+const STATUS_PLAN: OrderStatus[] = [
+  ...Array(27).fill(OrderStatus.PAID),
+  ...Array(2).fill(OrderStatus.PREPARING),
+  ...Array(2).fill(OrderStatus.READY),
+  ...Array(9).fill(OrderStatus.COMPLETED),
+  ...Array(3).fill(OrderStatus.CANCELLED),
+  OrderStatus.PENDING,
+  OrderStatus.PAYMENT_FAILED,
+];
+
+function calcDiscount(coupon: Coupon, subtotal: number): number {
+  const raw =
+    coupon.type === DiscountType.PERCENT
+      ? Math.floor((subtotal * coupon.value) / 100)
+      : coupon.value;
+  const capped = coupon.maxDiscount ? Math.min(raw, coupon.maxDiscount) : raw;
+  return Math.min(capped, subtotal);
+}
+
+interface SeedProductItem {
+  name: string;
+  price: number;
+  imageUrl: string;
+  description?: string;
+}
+
+async function main() {
+  const saltRounds = 10;
+
+  console.log('Đang dọn dẹp dữ liệu cũ...');
+  await prisma.notification.deleteMany();
+  await prisma.orderItemTopping.deleteMany();
+  await prisma.orderItem.deleteMany();
+  await prisma.payment.deleteMany();
+  await prisma.order.deleteMany();
+  await prisma.coupon.deleteMany();
+  await prisma.productSize.deleteMany();
+  await prisma.product.deleteMany();
+  await prisma.category.deleteMany();
+  await prisma.topping.deleteMany();
+  await prisma.user.deleteMany();
+
+  // 1. Tài khoản: 1 Admin + 4 khách hàng demo
+  const adminHash = await bcrypt.hash('Admin@2026', saltRounds);
+  const customerHash = await bcrypt.hash('Customer@2026', saltRounds);
+
+  await prisma.user.create({
+    data: {
+      email: 'admin@brewlite.com',
+      passwordHash: adminHash,
+      name: 'Quản Trị Viên',
+      role: Role.ADMIN,
+    },
+  });
+
+  const customerData = [
+    {
+      email: 'customer@brewlite.com',
+      name: 'Khách Hàng Demo',
+      phone: '0900000001',
+      gender: 'Nam',
+    },
+    {
+      email: 'lan@brewlite.com',
+      name: 'Nguyễn Thị Lan',
+      phone: '0900000002',
+      gender: 'Nữ',
+    },
+    {
+      email: 'minh@brewlite.com',
+      name: 'Trần Văn Minh',
+      phone: '0900000003',
+      gender: 'Nam',
+    },
+    {
+      email: 'huong@brewlite.com',
+      name: 'Lê Thu Hương',
+      phone: '0900000004',
+      gender: 'Nữ',
+    },
+  ];
+  const customers = [];
+  for (const c of customerData) {
+    customers.push(
+      await prisma.user.create({
+        data: { ...c, passwordHash: customerHash, role: Role.CUSTOMER },
+      }),
+    );
+  }
+  console.log('Đã tạo Admin và 4 khách hàng demo');
+
+  // 2. Tạo Topping trước để lấy ID liên kết với Danh mục
+  const topWhitePearl = await prisma.topping.create({
+    data: {
+      name: 'Trân châu trắng',
+      price: 10000,
+      imageUrl: '/uploads/toppings/topping-tranchautrang.jpg',
+    },
+  });
+  const topMacchiato = await prisma.topping.create({
+    data: {
+      name: 'Kem Macchiato',
+      price: 15000,
+      imageUrl: '/uploads/toppings/topping-macchiato.jpg',
+    },
+  });
+  const topPeachJelly = await prisma.topping.create({
+    data: {
+      name: 'Thạch đào',
+      price: 10000,
+      imageUrl: '/uploads/toppings/topping-thachdao.jpg',
+    },
+  });
+  const topBlackPearl = await prisma.topping.create({
+    data: {
+      name: 'Trân châu đen',
+      price: 5000,
+      imageUrl: '/uploads/toppings/topping-tranchauden.jpg',
+    },
+  });
+  const topFruitJelly = await prisma.topping.create({
+    data: {
+      name: 'Thạch trái cây',
+      price: 10000,
+      imageUrl: '/uploads/toppings/topping-thachtraicay.jpg',
+    },
+  });
+
+  const allToppings = [
+    topWhitePearl,
+    topMacchiato,
+    topPeachJelly,
+    topBlackPearl,
+    topFruitJelly,
+  ];
+  console.log('Đã tạo 5 loại topping');
+
+  // 3. Tạo Danh mục và gán Topping theo đúng nghiệp vụ
+  // 3.1 Cà phê: Không hỗ trợ topping
+  const categoryCoffee = await prisma.category.create({
+    data: {
+      name: 'Cà Phê',
+      description: 'Cà phê nguyên chất đậm đà',
+      imageUrl: '/uploads/categories/cat-coffee.jpg',
+    },
+  });
+
+  // 3.2 Trà sữa: Full 5 loại topping
+  const categoryMilkTea = await prisma.category.create({
+    data: {
+      name: 'Trà Sữa Pha Máy',
+      description: 'Trà sữa thơm ngon đậm vị trà',
+      imageUrl: '/uploads/categories/cat-milktea.jpg',
+      toppings: {
+        connect: allToppings.map((t) => ({ id: t.id })),
+      },
+    },
+  });
+
+  // 3.3 Trà trái cây: Chỉ có Trân châu trắng và Thạch trái cây
+  const categoryFruitTea = await prisma.category.create({
+    data: {
+      name: 'Trà Trái Cây',
+      description: 'Trà trái cây mát lạnh giải nhiệt',
+      imageUrl: '/uploads/categories/cat-fruittea.jpg',
+      toppings: {
+        connect: [{ id: topWhitePearl.id }, { id: topFruitJelly.id }],
+      },
+    },
+  });
+  console.log('Đã liên kết topping phù hợp cho từng danh mục');
+
+  // 4. Mã khuyến mãi
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - DAY);
+  const nextYear = new Date(now);
+  nextYear.setFullYear(now.getFullYear() + 1);
+
+  await prisma.coupon.createMany({
+    data: [
+      {
+        code: 'WELCOME10',
+        type: DiscountType.PERCENT,
+        value: 10,
+        minOrderValue: 30000,
+        maxDiscount: 20000,
+        usageLimit: 100,
+        startsAt: yesterday,
+        expiresAt: nextYear,
+      },
+      {
+        code: 'GIAM5K',
+        type: DiscountType.FIXED,
+        value: 5000,
+        minOrderValue: 20000,
+        startsAt: yesterday,
+        expiresAt: nextYear,
+      },
+      {
+        code: 'EXPIRED10',
+        type: DiscountType.PERCENT,
+        value: 10,
+        minOrderValue: 0,
+        startsAt: new Date(now.getTime() - 30 * DAY),
+        expiresAt: new Date(now.getTime() - 7 * DAY),
+      },
+      {
+        code: 'HETLUOT',
+        type: DiscountType.FIXED,
+        value: 10000,
+        minOrderValue: 0,
+        usageLimit: 1,
+        usedCount: 1,
+        startsAt: yesterday,
+        expiresAt: nextYear,
+      },
+    ],
+  });
+
+  // 5. Size
+  const standardSizes = [
+    { name: 'S', surcharge: 0 },
+    { name: 'M', surcharge: 5000 },
+    { name: 'L', surcharge: 10000 },
+  ];
+
+  const teaSizes = [
+    { name: 'M', surcharge: 0 },
+    { name: 'L', surcharge: 10000 },
+  ];
+
+  // 6. Menu 18 món
+  const coffeeProducts: SeedProductItem[] = [
+    {
+      name: 'Coffee Đen',
+      price: 15000,
+      imageUrl: '/uploads/products/coffee-den.jpg',
+      description:
+        'Cà phê đen truyền thống đậm đà, thơm nồng đánh thức mọi giác quan.',
+    },
+    {
+      name: 'Coffee Sữa',
+      price: 20000,
+      imageUrl: '/uploads/products/coffee-sua.jpg',
+      description:
+        'Sự kết hợp hoàn hảo giữa cà phê nguyên chất và sữa đặc béo ngậy.',
+    },
+    {
+      name: 'Bạc Xỉu',
+      price: 25000,
+      imageUrl: '/uploads/products/bac-xiu.jpg',
+      description:
+        'Vị ngọt béo của sữa hòa quyện chút đắng nhẹ của cà phê pha phin.',
+    },
+    {
+      name: 'Cacao',
+      price: 25000,
+      imageUrl: '/uploads/products/cacao.jpg',
+      description: 'Cacao nguyên chất thơm lừng, ấm áp và giàu năng lượng.',
+    },
+    {
+      name: 'Coffee Hạnh Nhân',
+      price: 25000,
+      imageUrl: '/uploads/products/coffee-hanh-nhan.jpg',
+      description:
+        'Cà phê kết hợp sốt hạnh nhân thơm bùi, hậu vị êm dịu độc đáo.',
+    },
+    {
+      name: 'Coffee Kem Muối',
+      price: 25000,
+      imageUrl: '/uploads/products/coffee-kem-muoi.jpg',
+      description:
+        'Lớp kem béo mặn sánh mịn hòa quyện hoàn hảo với cà phê đậm đà.',
+    },
+  ];
+
+  for (const item of coffeeProducts) {
+    await prisma.product.create({
+      data: {
+        name: item.name,
+        price: item.price,
+        stock: 100,
+        categoryId: categoryCoffee.id,
+        imageUrl: item.imageUrl,
+        description: item.description,
+        sizes: { create: standardSizes },
+      },
+    });
+  }
+
+  const milkTeaProducts: SeedProductItem[] = [
+    {
+      name: 'Trà Sữa Thái Xanh',
+      price: 20000,
+      imageUrl: '/uploads/products/tra-xanh-sua-thai.jpg',
+      description:
+        'Trà xanh Thái Lan thơm thảo mộc thanh mát cùng sữa ngọt béo.',
+    },
+    {
+      name: 'Trà Sữa Truyền Thống',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-sua-truyen-thong.jpg',
+      description: 'Công thức trà sữa cổ điển với hương vị đậm đà, khó quên.',
+    },
+    {
+      name: 'Trà Sữa Ô Long',
+      price: 25000,
+      imageUrl: '/uploads/products/tra-sua-o-long.jpg',
+      description: 'Trà Ô Long thượng hạng rang chín tới kết hợp sữa mịn màng.',
+    },
+    {
+      name: 'Trà Sữa Hạnh Nhân',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-sua-hanh-nhan.jpg',
+      description:
+        'Hương thơm nồng nàn của hạt hạnh nhân trong từng ngụm trà sữa.',
+    },
+    {
+      name: 'Trà Sữa Ô Long Kem Trứng',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-sua-o-long-kem-trung.jpg',
+      description:
+        'Lớp kem trứng nướng thơm lừng, ngầy ngậy trên nền trà Ô Long đậm vị.',
+    },
+  ];
+
+  for (const item of milkTeaProducts) {
+    await prisma.product.create({
+      data: {
+        name: item.name,
+        price: item.price,
+        stock: 100,
+        categoryId: categoryMilkTea.id,
+        imageUrl: item.imageUrl,
+        description: item.description,
+        sizes: { create: standardSizes },
+      },
+    });
+  }
+
+  const fruitTeaProducts: SeedProductItem[] = [
+    {
+      name: 'Trà Tắc',
+      price: 25000,
+      imageUrl: '/uploads/products/tra-tac.jpg',
+      description:
+        'Hương thơm nồng nàn đặc trưng của tắc tươi hòa quyện nền trà thanh dịu, mát lạnh giải nhiệt ngày hè.',
+    },
+    {
+      name: 'Trà Dâu',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-dau.jpg',
+      description:
+        'Vị chua ngọt bùng nổ từ dâu tây tươi mọng nước trên nền trà thanh dịu.',
+    },
+    {
+      name: 'Trà Đào Cam Sả',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-dao-cam-sa.jpg',
+      description:
+        'Hương sả the mát kết hợp đào thanh ngọt tạo nên thức uống giải nhiệt đỉnh cao.',
+    },
+    {
+      name: 'Trà Lài Vải',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-lai-vai.jpg',
+      description:
+        'Hương lài tinh tế kết hợp trái vải thiều mọng nước ngọt ngào.',
+    },
+    {
+      name: 'Trà Ổi Hồng',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-oi-hong.jpg',
+      description:
+        'Màu hồng rực rỡ cùng hương ổi xá lị tươi ngon ngập tràn sức sống.',
+    },
+    {
+      name: 'Trà Chanh Dây',
+      price: 30000,
+      imageUrl: '/uploads/products/tra-xoai-chanh-day.jpg',
+      description:
+        'Vị chua đậm đà từ cốt chanh dây tươi nguyên chất, bừng tỉnh năng lượng.',
+    },
+  ];
+
+  for (const item of fruitTeaProducts) {
+    await prisma.product.create({
+      data: {
+        name: item.name,
+        price: item.price,
+        stock: 100,
+        categoryId: categoryFruitTea.id,
+        imageUrl: item.imageUrl,
+        description: item.description,
+        sizes: { create: teaSizes },
+      },
+    });
+  }
+  console.log('Đã tạo menu 18 món kèm ảnh riêng biệt');
+
+  // 7. Tạo Đơn hàng mẫu (Tự động lọc Topping hợp lệ theo Danh mục)
+  const products = await prisma.product.findMany({
+    include: {
+      sizes: { where: { isAvailable: true } },
+      category: {
+        include: {
+          toppings: { where: { isAvailable: true } },
+        },
+      },
+    },
+    orderBy: { id: 'asc' },
+  });
+
+  const welcome = await prisma.coupon.findUniqueOrThrow({
+    where: { code: 'WELCOME10' },
+  });
+  const giam5k = await prisma.coupon.findUniqueOrThrow({
+    where: { code: 'GIAM5K' },
+  });
+
+  const orderSpecs = STATUS_PLAN.map((status) => {
+    const [minH, maxH] = AGE_HOURS[status];
+    const hoursAgo = minH + rand() * (maxH - minH);
+    return { status, createdAt: new Date(Date.now() - hoursAgo * HOUR) };
+  }).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+
+  const stockUsed = new Map<number, number>();
+  const couponUsed = new Map<number, number>();
+  const pointsEarned = new Map<number, number>();
+
+  let index = 0;
+  for (const spec of orderSpecs) {
+    index++;
+    const customer = pick(customers);
+
+    const items: Prisma.OrderItemUncheckedCreateWithoutOrderInput[] = [];
+    let subtotal = 0;
+    const itemCount = randInt(1, 3);
+
+    for (let i = 0; i < itemCount; i++) {
+      const product = pick(products);
+      const size = pick(product.sizes);
+
+      // CHỈ CHỌN TOPPING NẰM TRONG DANH MỤC CHO PHÉP CỦA MÓN NÀY
+      const allowedToppings = product.category?.toppings ?? [];
+      const chosenToppings =
+        allowedToppings.length > 0
+          ? shuffle(allowedToppings).slice(
+              0,
+              randInt(0, Math.min(2, allowedToppings.length)),
+            )
+          : [];
+
+      const qty = randInt(1, 2);
+      const toppingTotal = chosenToppings.reduce((sum, t) => sum + t.price, 0);
+      const lineTotal = (product.price + size.surcharge + toppingTotal) * qty;
+      subtotal += lineTotal;
+
+      items.push({
+        productId: product.id,
+        productSizeId: size.id,
+        productName: product.name,
+        unitPrice: product.price,
+        sizeName: size.name,
+        sizeSurcharge: size.surcharge,
+        qty,
+        lineTotal,
+        toppings: {
+          create: chosenToppings.map((t) => ({
+            toppingId: t.id,
+            toppingName: t.name,
+            price: t.price,
+            qty: 1,
+            lineTotal: t.price,
+          })),
+        },
+      });
+
+      if (PAID_GROUP.includes(spec.status)) {
+        stockUsed.set(product.id, (stockUsed.get(product.id) ?? 0) + qty);
+      }
+    }
+
+    let coupon: Coupon | undefined;
+    let discount = 0;
+    if (index % 4 === 0) {
+      const candidate = index % 8 === 0 ? welcome : giam5k;
+      if (subtotal >= candidate.minOrderValue) {
+        coupon = candidate;
+        discount = calcDiscount(candidate, subtotal);
+      }
+    }
+
+    const finalAmount = Math.max(0, subtotal - discount);
+    const isPaid = PAID_GROUP.includes(spec.status);
+    const points = isPaid ? Math.floor(finalAmount / 10000) : 0;
+
+    const order = await prisma.order.create({
+      data: {
+        userId: customer.id,
+        couponId: coupon?.id,
+        status: spec.status,
+        total: subtotal,
+        discountCode: coupon?.code,
+        discountAmount: discount,
+        finalAmount: finalAmount,
+        loyaltyPointsEarned: points,
+        createdAt: spec.createdAt,
+        updatedAt: new Date(
+          Math.min(
+            Date.now(),
+            spec.createdAt.getTime() + randInt(2, 30) * 60000,
+          ),
+        ),
+        orderItems: { create: items },
+      },
+    });
+
+    if (isPaid) {
+      pointsEarned.set(
+        customer.id,
+        (pointsEarned.get(customer.id) ?? 0) + points,
+      );
+      if (coupon)
+        couponUsed.set(coupon.id, (couponUsed.get(coupon.id) ?? 0) + 1);
+    }
+
+    // --- Thanh toán ---
+    const method = index % 2 === 0 ? PaymentMethod.WALLET : PaymentMethod.CARD;
+    const payAt = new Date(spec.createdAt.getTime() + 60000);
+    const mockTransactionId = `MOCK-TX-${Date.now()}-${order.id}`;
+
+    if (spec.status === OrderStatus.PAID && index % 9 === 0) {
+      await prisma.payment.create({
+        data: {
+          orderId: order.id,
+          idempotencyKey: `seed-${randomUUID()}`,
+          amount: finalAmount,
+          method,
+          status: PaymentStatus.FAILED,
+          createdAt: spec.createdAt,
+        },
+      });
+    }
+    if (isPaid) {
+      await prisma.payment.create({
+        data: {
+          orderId: order.id,
+          idempotencyKey: `seed-${randomUUID()}`,
+          amount: finalAmount,
+          method,
+          status: PaymentStatus.SUCCESS,
+          transactionId: mockTransactionId,
+          createdAt: payAt,
+        },
+      });
+    } else if (spec.status === OrderStatus.PAYMENT_FAILED) {
+      await prisma.payment.create({
+        data: {
+          orderId: order.id,
+          idempotencyKey: `seed-${randomUUID()}`,
+          amount: finalAmount,
+          method,
+          status: PaymentStatus.FAILED,
+          createdAt: payAt,
+        },
+      });
+    }
+  }
+
+  for (const [productId, qty] of stockUsed) {
+    await prisma.product.update({
+      where: { id: productId },
+      data: { stock: { decrement: qty }, version: { increment: 1 } },
+    });
+  }
+  for (const [couponId, count] of couponUsed) {
+    await prisma.coupon.update({
+      where: { id: couponId },
+      data: { usedCount: { increment: count } },
+    });
+  }
+  for (const [userId, points] of pointsEarned) {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { loyaltyPoints: { increment: points } },
+    });
+  }
+
+  // 8. Cảnh báo tồn kho & Thông báo mẫu cho Admin
+  const stockDemo = [
+    { product: products[3], stock: 8 },
+    { product: products[10], stock: 0 },
+  ];
+  for (const { product, stock } of stockDemo) {
+    await prisma.product.update({
+      where: { id: product.id },
+      data: { stock, version: { increment: 1 } },
+    });
+    const isOut = stock === 0;
+    await prisma.notification.create({
+      data: {
+        audience: NotificationAudience.ADMIN,
+        type: isOut
+          ? NotificationType.OUT_OF_STOCK
+          : NotificationType.LOW_STOCK,
+        title: isOut
+          ? `Hết hàng: ${product.name}`
+          : `Sắp hết hàng: ${product.name}`,
+        message: isOut
+          ? 'Sản phẩm đã hết hàng, cần nhập thêm'
+          : `Chỉ còn ${stock} sản phẩm trong kho`,
+        href: '/products',
+        productId: product.id,
+        dedupeKey: `STOCK:${product.id}`,
+      },
+    });
+  }
+
+  const recentOrders = await prisma.order.findMany({
+    where: {
+      status: {
+        in: [OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.PAYMENT_FAILED],
+      },
+    },
+    include: { user: { select: { name: true, email: true } } },
+    orderBy: { createdAt: 'desc' },
+    take: 8,
+  });
+  for (const o of recentOrders) {
+    const who = o.user?.name || o.user?.email || `Khách #${o.userId}`;
+    const amount = `${o.finalAmount.toLocaleString('vi-VN')}đ`;
+    const isFailed = o.status === OrderStatus.PAYMENT_FAILED;
+    const isPending = o.status === OrderStatus.PENDING;
+    await prisma.notification.create({
+      data: {
+        audience: NotificationAudience.ADMIN,
+        type: isFailed
+          ? NotificationType.PAYMENT_FAILED
+          : isPending
+            ? NotificationType.ORDER_NEW
+            : NotificationType.ORDER_UPDATE,
+        title: isFailed
+          ? `Thanh toán thất bại: đơn #${o.id}`
+          : isPending
+            ? `Đơn mới #${o.id}`
+            : `Đơn #${o.id} đã thanh toán`,
+        message: `${who} · ${amount}${isFailed || isPending ? '' : ' · cần chuẩn bị'}`,
+        href: '/orders/all',
+        orderId: o.id,
+        createdAt: o.createdAt,
+      },
+    });
+  }
+  console.log('Đã tạo thông báo mẫu');
+
+  const summary = await prisma.order.groupBy({
+    by: ['status'],
+    _count: true,
+  });
+  console.log(
+    'Đơn hàng mẫu theo trạng thái:',
+    summary.map((s) => `${s.status}=${s._count}`).join(', '),
+  );
+
+  console.log('Nạp toàn bộ dữ liệu thành công!');
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
+
+
+
+==================== FILE: apps\api\prisma\migrations\20261116035012_sync_category_toppings\migration.sql ====================
+-- CreateEnum
+CREATE TYPE "OrderStatus" AS ENUM ('PENDING', 'PAID', 'PREPARING', 'READY', 'COMPLETED', 'PAYMENT_FAILED', 'CANCELLED');
+
+-- CreateEnum
+CREATE TYPE "PaymentMethod" AS ENUM ('WALLET', 'CARD');
+
+-- CreateEnum
+CREATE TYPE "PaymentStatus" AS ENUM ('SUCCESS', 'FAILED');
+
+-- CreateEnum
+CREATE TYPE "Role" AS ENUM ('CUSTOMER', 'ADMIN');
+
+-- CreateEnum
+CREATE TYPE "DiscountType" AS ENUM ('PERCENT', 'FIXED');
+
+-- CreateEnum
+CREATE TYPE "NotificationType" AS ENUM ('ORDER_NEW', 'ORDER_UPDATE', 'PAYMENT_FAILED', 'ORDER_CANCELLED', 'LOW_STOCK', 'OUT_OF_STOCK');
+
+-- CreateEnum
+CREATE TYPE "NotificationAudience" AS ENUM ('ADMIN', 'CUSTOMER');
+
+-- CreateTable
+CREATE TABLE "User" (
+    "id" SERIAL NOT NULL,
+    "email" TEXT NOT NULL,
+    "passwordHash" TEXT NOT NULL,
+    "name" TEXT,
+    "phone" TEXT,
+    "gender" TEXT,
+    "loyaltyPoints" INTEGER NOT NULL DEFAULT 0,
+    "role" "Role" NOT NULL DEFAULT 'CUSTOMER',
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Category" (
+    "id" SERIAL NOT NULL,
+    "name" TEXT NOT NULL,
+    "description" TEXT,
+    "imageUrl" TEXT,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Category_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Product" (
+    "id" SERIAL NOT NULL,
+    "name" TEXT NOT NULL,
+    "price" INTEGER NOT NULL,
+    "imageUrl" TEXT,
+    "description" TEXT,
+    "stock" INTEGER NOT NULL,
+    "version" INTEGER NOT NULL DEFAULT 1,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "categoryId" INTEGER,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Product_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "ProductSize" (
+    "id" SERIAL NOT NULL,
+    "name" TEXT NOT NULL,
+    "surcharge" INTEGER NOT NULL,
+    "isAvailable" BOOLEAN NOT NULL DEFAULT true,
+    "productId" INTEGER NOT NULL,
+
+    CONSTRAINT "ProductSize_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Topping" (
+    "id" SERIAL NOT NULL,
+    "name" TEXT NOT NULL,
+    "price" INTEGER NOT NULL,
+    "imageUrl" TEXT,
+    "isAvailable" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Topping_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Coupon" (
+    "id" SERIAL NOT NULL,
+    "code" TEXT NOT NULL,
+    "type" "DiscountType" NOT NULL,
+    "value" INTEGER NOT NULL,
+    "minOrderValue" INTEGER NOT NULL,
+    "maxDiscount" INTEGER,
+    "usageLimit" INTEGER,
+    "usedCount" INTEGER NOT NULL DEFAULT 0,
+    "startsAt" TIMESTAMP(3) NOT NULL,
+    "expiresAt" TIMESTAMP(3) NOT NULL,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Coupon_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Order" (
+    "id" SERIAL NOT NULL,
+    "userId" INTEGER NOT NULL,
+    "couponId" INTEGER,
+    "status" "OrderStatus" NOT NULL DEFAULT 'PENDING',
+    "total" INTEGER NOT NULL,
+    "discountCode" TEXT,
+    "discountAmount" INTEGER NOT NULL DEFAULT 0,
+    "finalAmount" INTEGER NOT NULL,
+    "loyaltyPointsEarned" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Order_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "OrderItem" (
+    "id" SERIAL NOT NULL,
+    "orderId" INTEGER NOT NULL,
+    "productId" INTEGER NOT NULL,
+    "productSizeId" INTEGER,
+    "productName" TEXT NOT NULL,
+    "unitPrice" INTEGER NOT NULL,
+    "sizeName" TEXT,
+    "sizeSurcharge" INTEGER NOT NULL DEFAULT 0,
+    "qty" INTEGER NOT NULL,
+    "lineTotal" INTEGER NOT NULL,
+
+    CONSTRAINT "OrderItem_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "OrderItemTopping" (
+    "id" SERIAL NOT NULL,
+    "orderItemId" INTEGER NOT NULL,
+    "toppingId" INTEGER NOT NULL,
+    "toppingName" TEXT NOT NULL,
+    "price" INTEGER NOT NULL,
+    "qty" INTEGER NOT NULL DEFAULT 1,
+    "lineTotal" INTEGER NOT NULL,
+
+    CONSTRAINT "OrderItemTopping_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Payment" (
+    "id" SERIAL NOT NULL,
+    "orderId" INTEGER NOT NULL,
+    "idempotencyKey" TEXT NOT NULL,
+    "amount" INTEGER NOT NULL,
+    "method" "PaymentMethod" NOT NULL,
+    "status" "PaymentStatus" NOT NULL DEFAULT 'SUCCESS',
+    "transactionId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Payment_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Notification" (
+    "id" SERIAL NOT NULL,
+    "audience" "NotificationAudience" NOT NULL DEFAULT 'ADMIN',
+    "userId" INTEGER,
+    "type" "NotificationType" NOT NULL,
+    "title" TEXT NOT NULL,
+    "message" VARCHAR(500) NOT NULL,
+    "href" TEXT,
+    "orderId" INTEGER,
+    "productId" INTEGER,
+    "dedupeKey" TEXT,
+    "isRead" BOOLEAN NOT NULL DEFAULT false,
+    "readAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "Notification_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "_CategoryToppings" (
+    "A" INTEGER NOT NULL,
+    "B" INTEGER NOT NULL
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_phone_key" ON "User"("phone");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Category_name_key" ON "Category"("name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProductSize_productId_name_key" ON "ProductSize"("productId", "name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Topping_name_key" ON "Topping"("name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Coupon_code_key" ON "Coupon"("code");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Payment_idempotencyKey_key" ON "Payment"("idempotencyKey");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Notification_dedupeKey_key" ON "Notification"("dedupeKey");
+
+-- CreateIndex
+CREATE INDEX "Notification_audience_isRead_createdAt_idx" ON "Notification"("audience", "isRead", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "Notification_userId_isRead_idx" ON "Notification"("userId", "isRead");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "_CategoryToppings_AB_unique" ON "_CategoryToppings"("A", "B");
+
+-- CreateIndex
+CREATE INDEX "_CategoryToppings_B_index" ON "_CategoryToppings"("B");
+
+-- AddForeignKey
+ALTER TABLE "Product" ADD CONSTRAINT "Product_categoryId_fkey" FOREIGN KEY ("categoryId") REFERENCES "Category"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "ProductSize" ADD CONSTRAINT "ProductSize_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Order" ADD CONSTRAINT "Order_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Order" ADD CONSTRAINT "Order_couponId_fkey" FOREIGN KEY ("couponId") REFERENCES "Coupon"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "OrderItem" ADD CONSTRAINT "OrderItem_orderId_fkey" FOREIGN KEY ("orderId") REFERENCES "Order"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "OrderItem" ADD CONSTRAINT "OrderItem_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "OrderItem" ADD CONSTRAINT "OrderItem_productSizeId_fkey" FOREIGN KEY ("productSizeId") REFERENCES "ProductSize"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "OrderItemTopping" ADD CONSTRAINT "OrderItemTopping_orderItemId_fkey" FOREIGN KEY ("orderItemId") REFERENCES "OrderItem"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "OrderItemTopping" ADD CONSTRAINT "OrderItemTopping_toppingId_fkey" FOREIGN KEY ("toppingId") REFERENCES "Topping"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Payment" ADD CONSTRAINT "Payment_orderId_fkey" FOREIGN KEY ("orderId") REFERENCES "Order"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Notification" ADD CONSTRAINT "Notification_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "_CategoryToppings" ADD CONSTRAINT "_CategoryToppings_A_fkey" FOREIGN KEY ("A") REFERENCES "Category"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "_CategoryToppings" ADD CONSTRAINT "_CategoryToppings_B_fkey" FOREIGN KEY ("B") REFERENCES "Topping"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+
+
+==================== FILE: apps\api\src\main.ts ====================
+import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { join } from 'path';
+import { existsSync, mkdirSync } from 'fs';
+import { AppModule } from './app.module';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { ValidationPipe } from '@nestjs/common';
+import { TransformInterceptor } from './common/interceptors/transform.interceptor';
+import { HttpExceptionFilter } from './common/filters/http-exception.filter';
+
+async function bootstrap() {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+
+  // 1. Thêm tiền tố toàn cục /api cho toàn bộ endpoint
+  app.setGlobalPrefix('api');
+
+  // 2. Đảm bảo thư mục uploads luôn tồn tại khi chạy cục bộ để không bị crash
+  const uploadDir = join(process.cwd(), 'uploads');
+  if (!existsSync(uploadDir)) {
+    mkdirSync(uploadDir, { recursive: true });
+  }
+
+  // Mở quyền truy cập thư mục uploads qua đường dẫn /uploads/...
+  app.useStaticAssets(uploadDir, {
+    prefix: '/uploads/',
+  });
+
+  // 3. Mở CORS động: Tự động cho phép mọi client (localhost, Render frontend, preview domains)
+  // Kết hợp cùng credentials: true mà không sợ lỗi chặn header Access-Control-Allow-Origin
+  app.enableCors({
+    origin: true,
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    credentials: true,
+  });
+
+  // 4. Thiết lập Validation Pipe toàn cục
+  app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        stopAtFirstError: true,
+        transform: true,
+        transformOptions: { enableImplicitConversion: true },
+      }),
+  );
+
+  // 5. Cấu hình Swagger API Docs
+  const config = new DocumentBuilder()
+      .setTitle('BrewLite API')
+      .setDescription('API cho hệ thống đặt nước BrewLite')
+      .setVersion('1.0')
+      .addBearerAuth()
+      .build();
+
+  const document = SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('api/docs', app, document);
+
+  app.useGlobalInterceptors(new TransformInterceptor());
+  app.useGlobalFilters(new HttpExceptionFilter());
+
+  // 6. Lắng nghe cổng và tự động nhận diện Domain hiển thị log
+  const port = process.env.PORT || 3001;
+  await app.listen(port, '0.0.0.0');
+
+  const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
+
+  console.log(`[NestJS] API Server running on: ${baseUrl}/api`);
+  console.log(`[NestJS] Swagger Docs running on: ${baseUrl}/api/docs`);
+}
+bootstrap();
+
+
+==================== FILE: apps\api\src\app.module.ts ====================
+import { Module } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
+import { ServeStaticModule } from '@nestjs/serve-static';
+import { join } from 'path';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { PrismaModule } from './prisma/prisma.module';
+import { HealthModule } from './health/health.module';
+import { AuthModule } from './auth/auth.module';
+import { UsersModule } from './users/users.module';
+import { CategoriesModule } from './categories/categories.module';
+import { ProductsModule } from './products/products.module';
+import { ToppingsModule } from './toppings/toppings.module';
+import { OrdersModule } from './orders/orders.module';
+import { PaymentsModule } from './payments/payments.module';
+import { CouponsModule } from './coupons/coupons.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { ReportsModule } from './reports/reports.module';
+import { DashboardModule } from './dashboard/dashboard.module';
+
+@Module({
+  imports: [
+    ScheduleModule.forRoot(),
+    ServeStaticModule.forRoot({
+      rootPath: join(process.cwd(), 'uploads'),
+      serveRoot: '/uploads',
+    }),
+    PrismaModule,
+    HealthModule,
+    AuthModule,
+    UsersModule,
+    CategoriesModule,
+    ProductsModule,
+    ToppingsModule,
+    OrdersModule,
+    PaymentsModule,
+    CouponsModule,
+    NotificationsModule,
+    ReportsModule,
+    DashboardModule,
+  ],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}
+
+
+==================== FILE: apps\api\src\common\filters\http-exception.filter.ts ====================
+import {
+  ExceptionFilter,
+  Catch,
+  ArgumentsHost,
+  HttpException,
+} from '@nestjs/common';
+import { Response, Request } from 'express';
+
+@Catch(HttpException)
+export class HttpExceptionFilter implements ExceptionFilter {
+  catch(exception: HttpException, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
+    const status = exception.getStatus();
+    const exceptionResponse: any = exception.getResponse();
+
+    response.status(status).json({
+      statusCode: status,
+      // Ưu tiên lấy mảng message do ValidationPipe (DTO) trả ra, nếu không có thì lấy message mặc định
+      message: exceptionResponse.message || exception.message,
+      error: exceptionResponse.error || 'Lỗi hệ thống',
+      path: request.url,
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
+
+
+==================== FILE: apps\api\src\common\interceptors\transform.interceptor.ts ====================
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+} from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { map } from 'rxjs/operators';
+
+@Injectable()
+export class TransformInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const ctx = context.switchToHttp();
+    const response = ctx.getResponse();
+
+    return next.handle().pipe(
+      map((data) => ({
+        statusCode: response.statusCode,
+        message: data?.message || 'Thao tác thành công',
+        // Tránh bọc data 2 lần nếu trong Service bạn đã trả về object có key data
+        data: data?.data !== undefined ? data.data : data,
+      })),
+    );
+  }
+}
+
+
+
+==================== FILE: apps\api\src\common\upload\image-upload.options.ts ====================
+import { diskStorage } from 'multer';
+import { extname } from 'path';
+import { BadRequestException } from '@nestjs/common';
+import { MulterOptions } from '@nestjs/platform-express/multer/interfaces/multer-options.interface';
+
+export const imageUploadOptions: MulterOptions = {
+  // 1. Cấu hình nơi lưu trữ và đổi tên file
+  storage: diskStorage({
+    destination: './uploads',
+    filename: (req, file, cb) => {
+      // Tạo tên file độc nhất để không bị trùng lặp: timestamp-randomId.đuôi_file
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+      cb(null, `${uniqueSuffix}${extname(file.originalname)}`);
+    },
+  }),
+
+  // 2. Bộ lọc (Chỉ cho phép upload file ảnh, chống hacker upload script php/sh)
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.match(/\/(jpg|jpeg|png|gif|webp)$/)) {
+      cb(null, true);
+    } else {
+      cb(
+        new BadRequestException(
+          `Định dạng file không hợp lệ. Chỉ chấp nhận các file ảnh (jpg, jpeg, png, gif, webp).`,
+        ),
+        false,
+      );
+    }
+  },
+
+  // 3. Giới hạn dung lượng (Chống DDoS đầy ổ cứng)
+  limits: {
+    fileSize: 5 * 1024 * 1024, // Tối đa 5MB / 1 file
+  },
+};
+
+
+
+==================== FILE: apps\api\src\prisma\prisma.module.ts ====================
+import { Global, Module } from '@nestjs/common';
+import { PrismaService } from './prisma.service';
+
+@Global()
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class PrismaModule {}
+
+
+
+==================== FILE: apps\api\src\prisma\prisma.service.ts ====================
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit {
+  async onModuleInit() {
+    await this.$connect();
+  }
+}
+
+
+
+==================== FILE: apps\api\src\auth\auth.controller.ts ====================
+import {
+  Body,
+  Controller,
+  HttpCode,
+  HttpStatus,
+  Post,
+  Patch,
+  Req,
+  UseGuards,
+  BadRequestException,
+} from '@nestjs/common';
+import { AuthService } from './auth.service';
+import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
+import { LoginDto } from './dto/login.dto';
+import { CreateUserDto } from '../users/dto/create-user.dto';
+import { ChangePasswordDto } from '../users/dto/change-password.dto';
+@ApiTags('Auth (Xác thực)')
+@Controller('auth')
+export class AuthController {
+  constructor(private readonly authService: AuthService) {}
+
+  @Post('register')
+  @ApiOperation({ summary: 'Đăng ký tài khoản khách hàng (Public)' })
+  register(@Body() createUserDto: CreateUserDto) {
+    return this.authService.register(createUserDto);
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('login')
+  @ApiOperation({ summary: 'Đăng nhập và nhận JWT Token' })
+  signIn(@Body() loginDto: LoginDto) {
+    return this.authService.login(loginDto.email, loginDto.password);
+  }
+
+  // ========================================================
+  // ENDPOINT ĐỔI MẬT KHẨU
+  // ========================================================
+  @Patch('change-password')
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Khách hàng / Admin đổi mật khẩu' })
+  changePassword(@Req() req: any, @Body() dto: ChangePasswordDto) {
+    const userId = req.user?.id || req.user?.userId || req.user?.sub;
+    if (!userId) {
+      throw new BadRequestException('Vui lòng đăng nhập để thực hiện');
+    }
+    return this.authService.changePassword(userId, dto);
+  }
+}
+
+
+==================== FILE: apps\api\src\auth\auth.module.ts ====================
+import { Module } from '@nestjs/common';
+import { AuthService } from './auth.service';
+import { AuthController } from './auth.controller';
+import { JwtStrategy } from './jwt.strategy'; // Import JwtStrategy
+import { JwtModule } from '@nestjs/jwt';
+import { PrismaModule } from '../prisma/prisma.module';
+import { UsersModule } from '../users/users.module';
+
+@Module({
+  imports: [
+    PrismaModule,
+    UsersModule,
+    JwtModule.register({
+      global: true,
+      secret: 'SECRET_KEY_BREWLITE_2026', // Khớp với secret key trong JwtStrategy
+      signOptions: { expiresIn: '1d' },
+    }),
+  ],
+  controllers: [AuthController], //[cite: 5]
+  providers: [AuthService, JwtStrategy], //[cite: 5]
+})
+export class AuthModule {}
+
+
+
+==================== FILE: apps\api\src\auth\auth.service.ts ====================
+import {
+  Injectable,
+  UnauthorizedException,
+  ForbiddenException,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { JwtService } from '@nestjs/jwt';
+import * as bcrypt from 'bcrypt';
+import { UsersService } from '../users/users.service';
+import { CreateUserDto } from '../users/dto/create-user.dto';
+import { ChangePasswordDto } from '../users/dto/change-password.dto';import { Role } from '@prisma/client';
+
+@Injectable()
+export class AuthService {
+  constructor(
+      private prisma: PrismaService,
+      private jwtService: JwtService,
+      private usersService: UsersService,
+  ) {}
+
+  async register(createUserDto: CreateUserDto) {
+    return this.usersService.create(createUserDto, Role.CUSTOMER);
+  }
+
+  async login(email: string, pass: string) {
+    const user = await this.prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      throw new UnauthorizedException(
+          'Tài khoản hoặc mật khẩu không chính xác',
+      );
+    }
+
+    if (!user.isActive) {
+      throw new ForbiddenException(
+          'Tài khoản của bạn đã bị khóa. Vui lòng liên hệ Quản trị viên để biết thêm chi tiết.',
+      );
+    }
+
+    const isPasswordMatching = await bcrypt.compare(pass, user.passwordHash);
+    if (!isPasswordMatching) {
+      throw new UnauthorizedException(
+          'Tài khoản hoặc mật khẩu không chính xác',
+      );
+    }
+
+    const payload = { sub: user.id, email: user.email, role: user.role };
+
+    return {
+      access_token: await this.jwtService.signAsync(payload),
+      user: {
+        id: user.id,
+        name: user.name,
+        role: user.role,
+        loyaltyPoints: user.loyaltyPoints,
+      },
+    };
+  }
+
+  // ========================================================
+  // ENDPOINT ĐỔI MẬT KHẨU (Khớp với ChangePasswordDto & passwordHash)
+  // ========================================================
+  async changePassword(userId: number, dto: ChangePasswordDto) {
+    if (dto.newPassword !== dto.confirmNewPassword) {
+      throw new BadRequestException('Xác nhận mật khẩu mới không khớp');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('Không tìm thấy thông tin tài khoản');
+    }
+
+    // 1. So khớp mật khẩu cũ với cột passwordHash trong DB
+    const isOldPasswordMatch = await bcrypt.compare(
+        dto.oldPassword,
+        user.passwordHash,
+    );
+    if (!isOldPasswordMatch) {
+      throw new BadRequestException('Mật khẩu cũ không chính xác');
+    }
+
+    // 2. Không cho phép đặt trùng mật khẩu cũ
+    const isSameAsOld = await bcrypt.compare(
+        dto.newPassword,
+        user.passwordHash,
+    );
+    if (isSameAsOld) {
+      throw new BadRequestException(
+          'Mật khẩu mới không được trùng với mật khẩu hiện tại',
+      );
+    }
+
+    // 3. Băm mật khẩu mới và cập nhật vào cột passwordHash
+    const newPasswordHash = await bcrypt.hash(dto.newPassword, 10);
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash: newPasswordHash },
+    });
+
+    return {
+      success: true,
+      message: 'Đổi mật khẩu thành công',
+    };
+  }
+}
+
+
+==================== FILE: apps\api\src\auth\jwt.strategy.ts ====================
+import { ExtractJwt, Strategy } from 'passport-jwt';
+import { PassportStrategy } from '@nestjs/passport';
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy) {
+  constructor() {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      ignoreExpiration: false,
+      secretOrKey: 'SECRET_KEY_BREWLITE_2026', // Phải khớp với secret key trong AuthModule
+    });
+  }
+
+  async validate(payload: any) {
+    // Trả về thông tin user được bọc trong token
+    return { userId: payload.sub, email: payload.email, role: payload.role };  }
+}
+
+
+
+==================== FILE: apps\api\src\auth\decorators\roles.decorator.ts ====================
+import { SetMetadata } from '@nestjs/common';
+import { Role } from '@prisma/client';
+
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: Role[]) => SetMetadata(ROLES_KEY, roles);
+
+
+
+==================== FILE: apps\api\src\auth\dto\login.dto.ts ====================
+import { ApiProperty } from '@nestjs/swagger';
+import { IsEmail, IsNotEmpty } from 'class-validator';
+
+export class LoginDto {
+  @ApiProperty({
+    example: 'taikhoan@gmail.com',
+    description: 'Email đăng nhập',
+  })
+  @IsEmail({}, { message: 'Email không hợp lệ' })
+  email: string;
+
+  @ApiProperty({ example: '12345678', description: 'Mật khẩu' })
+  @IsNotEmpty({ message: 'Vui lòng nhập mật khẩu' })
+  password: string;
+}
+
+
+
+==================== FILE: apps\api\src\auth\guards\roles.guard.ts ====================
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+} from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { Role } from '@prisma/client';
+import { ROLES_KEY } from '../decorators/roles.decorator';
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const requiredRoles = this.reflector.getAllAndOverride<Role[]>(ROLES_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    // Nếu API không yêu cầu quyền gì, cho phép qua
+    if (!requiredRoles) {
+      return true;
+    }
+
+    const { user } = context.switchToHttp().getRequest();
+
+    // Kiểm tra quyền
+    if (!user || !user.role) {
+      throw new ForbiddenException('Không tìm thấy thông tin định danh');
+    }
+
+    const hasRole = requiredRoles.includes(user.role);
+    if (!hasRole) {
+      throw new ForbiddenException(
+        'Chỉ Quản trị viên (Admin) mới có quyền thực hiện hành động này',
+      );
+    }
+    return true;
+  }
+}
+
+
+
+==================== FILE: apps\api\src\users\users.controller.ts ====================
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  UseGuards,
+  Request,
+  Query,
+  ParseIntPipe,
+  BadRequestException,
+} from '@nestjs/common';
+import { UsersService } from './users.service';
+import { CreateUserDto } from './dto/create-user.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { QueryUserDto } from './dto/query-user.dto';
+import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { Role } from '@prisma/client';
+
+@ApiTags('Users (Người dùng)')
+@Controller('users')
+export class UsersController {
+  constructor(private readonly usersService: UsersService) {}
+
+  // ========================================================
+  // 1. NHÓM API DÀNH CHO CÁ NHÂN (ME) - Khách hàng tự quản lý
+  // ========================================================
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'))
+  @Get('me')
+  @ApiOperation({ summary: 'Lấy thông tin cá nhân' })
+  getProfile(@Request() req: any) {
+    return this.usersService.findOne(req.user.userId);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'))
+  @Patch('me')
+  @ApiOperation({ summary: 'Cập nhật thông tin cá nhân' })
+  updateProfile(@Request() req: any, @Body() updateUserDto: UpdateUserDto) {
+    return this.usersService.update(req.user.userId, updateUserDto);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'))
+  @Patch('me/password')
+  @ApiOperation({ summary: 'Đổi mật khẩu cá nhân' })
+  changePassword(
+    @Request() req: any,
+    @Body() changePasswordDto: ChangePasswordDto,
+  ) {
+    return this.usersService.changePassword(req.user.userId, changePasswordDto);
+  }
+
+  // ========================================================
+  // 2. NHÓM API DÀNH RIÊNG CHO ADMIN
+  // ========================================================
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Post()
+  @ApiOperation({ summary: 'Tạo tài khoản Admin mới (Chỉ Admin)' })
+  createAdmin(@Body() createUserDto: CreateUserDto) {
+    return this.usersService.create(createUserDto, Role.ADMIN);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get()
+  @ApiOperation({ summary: 'Lấy danh sách người dùng (Chỉ Admin)' })
+  // Thay thế bằng QueryUserDto để nhận search, page, limit, role
+  findAll(@Query() query: QueryUserDto) {
+    return this.usersService.findAll(query);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get(':id')
+  @ApiOperation({ summary: 'Xem chi tiết người dùng bất kỳ (Chỉ Admin)' })
+  findOneForAdmin(@Param('id', ParseIntPipe) id: number) {
+    return this.usersService.findOne(id);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id')
+  @ApiOperation({ summary: 'Cập nhật thông tin người dùng bất kỳ (Chỉ Admin)' })
+  updateForAdmin(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() updateUserDto: UpdateUserDto,
+  ) {
+    return this.usersService.update(id, updateUserDto);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id/status')
+  @ApiOperation({ summary: 'Khóa / Mở khóa tài khoản (Chỉ Admin)' })
+  toggleStatus(@Request() req: any, @Param('id', ParseIntPipe) id: number) {
+    // Lấy ID của Admin đang thực hiện thao tác
+    const currentAdminId: any = req.user.userId;
+
+    // Nếu Admin cố tình truyền ID của chính mình thì chặn lại
+    if (currentAdminId === id) {
+      throw new BadRequestException(
+        'Bạn không thể khóa tài khoản của chính mình!',
+      );
+    }
+
+    return this.usersService.toggleStatus(id);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\users\users.module.ts ====================
+import { Module } from '@nestjs/common';
+import { UsersService } from './users.service';
+import { UsersController } from './users.controller';
+import { PrismaModule } from '../prisma/prisma.module'; // 1. Import PrismaModule
+
+@Module({
+  imports: [PrismaModule],
+  controllers: [UsersController],
+  providers: [UsersService],
+  exports: [UsersService],
+})
+export class UsersModule {}
+
+
+
+==================== FILE: apps\api\src\users\users.service.ts ====================
+import {
+  Injectable,
+  ConflictException,
+  NotFoundException,
+  BadRequestException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateUserDto } from './dto/create-user.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { QueryUserDto } from './dto/query-user.dto';
+import * as bcrypt from 'bcrypt';
+import { Role } from '@prisma/client';
+
+@Injectable()
+export class UsersService {
+  constructor(private prisma: PrismaService) {}
+
+  async create(createUserDto: CreateUserDto, role: Role = Role.CUSTOMER) {
+    // 1. Kiểm tra trùng Email
+    const existingEmail = await this.prisma.user.findUnique({
+      where: { email: createUserDto.email },
+    });
+    if (existingEmail) {
+      throw new ConflictException('Email này đã được sử dụng');
+    }
+
+    // 2. Kiểm tra trùng Số điện thoại
+    if (createUserDto.phone) {
+      const existingPhone = await this.prisma.user.findUnique({
+        where: { phone: createUserDto.phone },
+      });
+      if (existingPhone) {
+        throw new ConflictException('Số điện thoại này đã được sử dụng');
+      }
+    }
+
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(
+      createUserDto.password,
+      saltRounds,
+    );
+
+    const newUser = await this.prisma.user.create({
+      data: {
+        email: createUserDto.email,
+        name: createUserDto.name,
+        phone: createUserDto.phone,
+        gender: createUserDto.gender,
+        passwordHash: hashedPassword,
+        role: role,
+      },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        phone: true,
+        gender: true,
+        loyaltyPoints: true,
+        role: true,
+      },
+    });
+
+    return { message: 'Tạo tài khoản thành công', data: newUser };
+  }
+
+  // Cập nhật hàm findAll để hỗ trợ phân trang và tìm kiếm
+  async findAll(query: QueryUserDto) {
+    const { search, role, page, limit } = query;
+    const skip = (page - 1) * limit;
+
+    const whereCondition: any = {};
+
+    if (role) {
+      whereCondition.role = role;
+    }
+
+    if (search) {
+      // Tìm kiếm tương đối trên name, email và phone
+      whereCondition.OR = [
+        { name: { contains: search } },
+        { email: { contains: search } },
+        { phone: { contains: search } },
+      ];
+    }
+
+    const [data, total] = await Promise.all([
+      this.prisma.user.findMany({
+        where: whereCondition,
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          phone: true,
+          gender: true,
+          loyaltyPoints: true,
+          role: true,
+          isActive: true,
+        },
+        skip,
+        take: limit,
+        orderBy: { id: 'desc' },
+      }),
+      this.prisma.user.count({ where: whereCondition }),
+    ]);
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async findOne(id: number) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        phone: true,
+        gender: true,
+        loyaltyPoints: true,
+        role: true,
+        isActive: true,
+      },
+    });
+
+    if (!user)
+      throw new NotFoundException(`Không tìm thấy người dùng với ID ${id}`);
+    return user;
+  }
+
+  async changePassword(userId: number, changePasswordDto: ChangePasswordDto) {
+    if (
+      changePasswordDto.newPassword !== changePasswordDto.confirmNewPassword
+    ) {
+      throw new BadRequestException('Xác nhận mật khẩu không khớp!');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException('Người dùng không tồn tại');
+
+    const isMatch = await bcrypt.compare(
+      changePasswordDto.oldPassword,
+      user.passwordHash,
+    );
+    if (!isMatch) throw new BadRequestException('Mật khẩu cũ không chính xác');
+
+    const saltRounds = 10;
+    const hashedNewPassword = await bcrypt.hash(
+      changePasswordDto.newPassword,
+      saltRounds,
+    );
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash: hashedNewPassword },
+    });
+
+    return { message: 'Đổi mật khẩu thành công. Vui lòng đăng nhập lại.' };
+  }
+
+  async update(id: number, updateUserDto: UpdateUserDto) {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    if (!user)
+      throw new NotFoundException(`Không tìm thấy người dùng với ID ${id}`);
+
+    if (updateUserDto.phone && updateUserDto.phone !== user.phone) {
+      const existingPhone = await this.prisma.user.findFirst({
+        where: {
+          phone: updateUserDto.phone,
+          id: { not: id },
+        },
+      });
+      if (existingPhone) {
+        throw new ConflictException(
+          'Số điện thoại này đã được sử dụng bởi một tài khoản khác',
+        );
+      }
+    }
+
+    // --- BẮT ĐẦU ĐOẠN SỬA LỖI BĂM MẬT KHẨU ---
+    const updateData: any = { ...updateUserDto };
+
+    // Nếu Admin điền mật khẩu mới ở giao diện Edit
+    if (updateData.password) {
+      // 1. Băm mật khẩu ra
+      const saltRounds = 10;
+      updateData.passwordHash = await bcrypt.hash(
+        updateData.password,
+        saltRounds,
+      );
+
+      // 2. Xóa cái trường password chữ thường đi để tránh Prisma báo lỗi
+      delete updateData.password;
+    }
+    // --- KẾT THÚC ĐOẠN SỬA LỖI ---
+
+    return this.prisma.user.update({
+      where: { id },
+      data: updateData, // Dùng updateData thay vì updateUserDto
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        phone: true,
+        gender: true,
+        loyaltyPoints: true,
+        role: true,
+        isActive: true, // Nhớ thêm isActive để trả về Frontend
+      },
+    });
+  }
+
+  async toggleStatus(id: number) {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    if (!user)
+      throw new NotFoundException(`Không tìm thấy người dùng với ID ${id}`);
+
+    //if (user.role === Role.ADMIN) {
+    //throw new ConflictException('Không thể khóa tài khoản Admin!');
+    //}
+
+    const updatedUser = await this.prisma.user.update({
+      where: { id },
+      data: { isActive: !user.isActive },
+      select: { id: true, name: true, isActive: true },
+    });
+
+    return {
+      message: updatedUser.isActive
+        ? `Đã mở khóa tài khoản ${updatedUser.name}`
+        : `Đã khóa tài khoản ${updatedUser.name}`,
+    };
+  }
+}
+
+
+
+==================== FILE: apps\api\src\users\dto\change-password.dto.ts ====================
+import { ApiProperty } from '@nestjs/swagger';
+import {
+  IsString,
+  IsNotEmpty,
+  MinLength,
+  MaxLength,
+  Matches,
+} from 'class-validator';
+
+export class ChangePasswordDto {
+  @ApiProperty({ example: 'MatKhauCu123', description: 'Mật khẩu hiện tại' })
+  @IsString()
+  @IsNotEmpty({ message: 'Vui lòng nhập mật khẩu cũ' })
+  oldPassword: string;
+
+  @ApiProperty({ example: 'Abc@123456!', description: 'Mật khẩu mới' })
+  @Matches(
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/,
+    {
+      message:
+        'Mật khẩu phải chứa ít nhất 1 chữ hoa, 1 chữ thường, 1 chữ số và 1 ký tự đặc biệt',
+    },
+  )
+  @MaxLength(50, { message: 'Mật khẩu không được vượt quá 50 ký tự' })
+  @MinLength(8, { message: 'Mật khẩu phải từ 8 ký tự trở lên' })
+  @IsString()
+  @IsNotEmpty({ message: 'Vui lòng nhập mật khẩu mới' })
+  newPassword: string;
+
+  @ApiProperty({ example: 'Abc@123456!', description: 'Xác nhận mật khẩu mới' })
+  @IsString()
+  @IsNotEmpty({ message: 'Vui lòng xác nhận mật khẩu mới' })
+  confirmNewPassword: string;
+}
+
+
+
+==================== FILE: apps\api\src\users\dto\create-user.dto.ts ====================
+import { ApiProperty } from '@nestjs/swagger';
+import {
+  IsEmail,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  Matches,
+  MaxLength,
+  MinLength,
+  IsIn,
+} from 'class-validator';
+
+export class CreateUserDto {
+  @ApiProperty({
+    example: 'khachhang@gmail.com',
+    description: 'Email đăng nhập',
+  })
+  @MaxLength(255, { message: 'Email không được vượt quá 255 ký tự' })
+  @IsEmail({}, { message: 'Email không đúng định dạng' })
+  @IsNotEmpty({ message: 'Email không được để trống' })
+  email: string;
+
+  @ApiProperty({
+    example: 'Abc@1234',
+    description: 'Mật khẩu bảo mật cao',
+  })
+  @Matches(
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/,
+    {
+      message:
+        'Mật khẩu phải chứa ít nhất 1 chữ hoa, 1 chữ thường, 1 chữ số và 1 ký tự đặc biệt',
+    },
+  )
+  @MaxLength(50, { message: 'Mật khẩu không được vượt quá 50 ký tự' })
+  @MinLength(8, { message: 'Mật khẩu phải từ 8 ký tự trở lên' })
+  @IsString({ message: 'Mật khẩu phải là chuỗi ký tự' })
+  @IsNotEmpty({ message: 'Mật khẩu không được để trống' })
+  password: string;
+
+  @ApiProperty({
+    example: 'Nguyễn Văn A',
+    description: 'Họ và tên',
+    required: false,
+  })
+  @MaxLength(100, { message: 'Họ và tên không được vượt quá 100 ký tự' })
+  @Matches(/^[\p{L}\s]+$/u, {
+    message:
+      'Họ và tên chỉ được chứa chữ cái và khoảng trắng, không chứa số hay ký tự đặc biệt',
+  })
+  @IsString({ message: 'Họ và tên phải là chuỗi ký tự' })
+  @IsOptional()
+  name?: string;
+
+  @ApiProperty({
+    example: '0901234567',
+    required: false,
+    description: 'Số điện thoại VN',
+  })
+  @IsOptional()
+  @Matches(/^(84|0[35789])[0-9]{8}$/, {
+    message:
+      'Số điện thoại không hợp lệ (Phải là số điện thoại Việt Nam 10 số, không chứa chữ cái, kí tự đặc biệt)',
+  })
+  phone?: string;
+
+  @ApiProperty({
+    example: 'Nam',
+    required: false,
+    description: 'Giới tính (Nam, Nữ)',
+  })
+  @IsOptional()
+  @IsString()
+  @IsIn(['Nam', 'Nữ', 'Khác'], {
+    message: 'Giới tính phải là Nam hoặc Nữ',
+  })
+  gender?: string;
+}
+
+
+
+==================== FILE: apps\api\src\users\dto\query-user.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform, Type } from 'class-transformer';
+import { IsInt, IsOptional, IsString, Max, Min, IsEnum } from 'class-validator';
+import { Role } from '@prisma/client';
+
+export class QueryUserDto {
+  @ApiPropertyOptional({
+    description: 'Tìm theo tên, email hoặc số điện thoại',
+  })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsOptional()
+  @IsString()
+  search?: string;
+
+  @ApiPropertyOptional({
+    enum: Role,
+    description: 'Lọc theo quyền (ADMIN / CUSTOMER)',
+  })
+  @IsOptional()
+  @IsEnum(Role)
+  role?: Role;
+
+  @ApiPropertyOptional({ type: Number, default: 1 })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  page: number = 1;
+
+  @ApiPropertyOptional({ type: Number, default: 20, maximum: 100 })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit: number = 20;
+}
+
+
+
+==================== FILE: apps\api\src\users\dto\update-user.dto.ts ====================
+import { PartialType, ApiPropertyOptional } from '@nestjs/swagger';
+import { CreateUserDto } from './create-user.dto';
+import { IsOptional, IsBoolean, IsString } from 'class-validator';
+
+export class UpdateUserDto extends PartialType(CreateUserDto) {
+  @ApiPropertyOptional({ example: '0987654321', description: 'Số điện thoại' })
+  @IsOptional()
+  @IsString()
+  phone?: string;
+
+  @ApiPropertyOptional({ example: 'newpass123', description: 'Mật khẩu mới' })
+  @IsOptional()
+  @IsString()
+  password?: string;
+
+  @ApiPropertyOptional({ example: true, description: 'Trạng thái hoạt động' })
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
+}
+
+
+

@@ -1,0 +1,5330 @@
+﻿
+==================== FILE: apps\api\src\orders\orders-concurrency.spec.ts ====================
+import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { ConflictException } from '@nestjs/common';
+import { OrdersService } from './orders.service';
+import { OrderStatus } from '@prisma/client';
+
+// Mock @nestjs/common để chặn Node nạp file Pure ESM
+jest.mock('@nestjs/common', () => {
+    class ConflictException extends Error {
+        constructor(message = 'Conflict') {
+            super(message);
+            this.name = 'ConflictException';
+        }
+    }
+    return {
+        Injectable: () => (target: any) => target,
+        Logger: class { log() {} warn() {} error() {} },
+        BadRequestException: class extends Error {},
+        ConflictException,
+    };
+});
+
+jest.mock('@nestjs/schedule', () => ({
+    Cron: () => (target: any, key: any, descriptor: any) => descriptor,
+    CronExpression: { EVERY_MINUTE: '* * * * *' },
+}));
+
+describe('Tiêu chí (c): Concurrency & Optimistic Locking - Chống bán vượt tồn kho (Overselling)', () => {
+    let service: OrdersService;
+    let mockPrisma: any;
+    let mockNotifications: any;
+
+    beforeEach(() => {
+        mockPrisma = {
+            user: { findUnique: jest.fn() },
+            product: {
+                findUnique: jest.fn(),
+                updateMany: jest.fn(),
+            },
+            productSize: { findMany: jest.fn() },
+            order: { create: jest.fn() },
+            $transaction: jest.fn((cb: any) => cb(mockPrisma)),
+        };
+
+        mockNotifications = {
+            notifyOrderCreated: jest.fn(),
+            syncStockAlerts: jest.fn(),
+        };
+
+        service = new OrdersService(mockPrisma, mockNotifications);
+    });
+
+    it('Kho còn 1 ly, 3 request gửi đồng thời: Chỉ 1 request thành công, 2 request bị chặn với ConflictException', async () => {
+        const productId = 10;
+        const initialStock = 1;
+        const initialVersion = 1;
+
+        (mockPrisma.user.findUnique as any).mockResolvedValue({
+            id: 1,
+            isActive: true,
+        });
+
+        (mockPrisma.product.findUnique as any).mockResolvedValue({
+            id: productId,
+            name: 'Trà Sữa Oolong',
+            price: 35000,
+            stock: initialStock,
+            version: initialVersion,
+            isActive: true,
+            category: { isActive: true, toppings: [] },
+        });
+
+        (mockPrisma.productSize.findMany as any).mockResolvedValue([]);
+
+        let hasUpdated = false;
+        (mockPrisma.product.updateMany as any).mockImplementation((async (args: any) => {
+            if (!hasUpdated && args?.where?.version === 1 && args?.where?.stock?.gte >= 1) {
+                hasUpdated = true;
+                return { count: 1 };
+            }
+            return { count: 0 };
+        }) as any);
+
+        (mockPrisma.order.create as any).mockResolvedValue({
+            id: 999,
+            status: OrderStatus.PENDING,
+            total: 35000,
+            finalAmount: 35000,
+            orderItems: [],
+        });
+
+        const orderPayload = {
+            items: [{ productId, quantity: 1, size: 'M' }],
+        };
+
+        const req1 = service.create(1, orderPayload as any);
+        const req2 = service.create(1, orderPayload as any);
+        const req3 = service.create(1, orderPayload as any);
+
+        const results = await Promise.allSettled([req1, req2, req3]);
+
+        const fulfilled = results.filter((r) => r.status === 'fulfilled');
+        const rejected = results.filter((r) => r.status === 'rejected');
+
+        expect(fulfilled.length).toBe(1);
+        expect(rejected.length).toBe(2);
+
+        rejected.forEach((rej: any) => {
+            expect(rej.reason).toBeInstanceOf(ConflictException);
+            expect(rej.reason.message).toContain('biến động tồn kho do người khác đặt cùng lúc');
+        });
+    });
+});
+
+
+==================== FILE: apps\api\src\orders\orders-state-machine.spec.ts ====================
+import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { BadRequestException } from '@nestjs/common';
+import { OrdersService } from './orders.service';
+import { OrderStatus } from '@prisma/client';
+
+// Mock @nestjs/common để chặn Node nạp file Pure ESM
+jest.mock('@nestjs/common', () => {
+    class BadRequestException extends Error {
+        constructor(message = 'Bad Request') {
+            super(message);
+            this.name = 'BadRequestException';
+        }
+    }
+    return {
+        Injectable: () => (target: any) => target,
+        Logger: class { log() {} warn() {} error() {} },
+        BadRequestException,
+        NotFoundException: class extends Error {},
+        ConflictException: class extends Error {},
+    };
+});
+
+jest.mock('@nestjs/schedule', () => ({
+    Cron: () => (target: any, key: any, descriptor: any) => descriptor,
+    CronExpression: { EVERY_MINUTE: '* * * * *' },
+}));
+
+describe('Tiêu chí (a): Order State Machine Transition Guard', () => {
+    let service: OrdersService;
+    let mockPrisma: any;
+    let mockNotifications: any;
+
+    beforeEach(() => {
+        mockPrisma = {
+            order: {
+                findUnique: jest.fn(),
+                update: jest.fn(),
+            },
+            product: { update: jest.fn() },
+            coupon: { update: jest.fn() },
+            user: { findUnique: jest.fn(), update: jest.fn() },
+            $transaction: jest.fn((cb: any) => cb(mockPrisma)),
+        };
+
+        mockNotifications = {
+            notifyOrderStatusChanged: jest.fn(),
+            syncStockAlerts: jest.fn(),
+        };
+
+        service = new OrdersService(mockPrisma, mockNotifications);
+    });
+
+    describe('1. Chặn các bước chuyển trạng thái không hợp lệ', () => {
+        const invalidTransitions = [
+            { from: OrderStatus.COMPLETED, to: OrderStatus.PENDING, desc: 'Đã hoàn tất không thể quay lại chờ duyệt' },
+            { from: OrderStatus.COMPLETED, to: OrderStatus.PAID, desc: 'Đã hoàn tất không thể quay lại đã thanh toán' },
+            { from: OrderStatus.CANCELLED, to: OrderStatus.PAID, desc: 'Đã hủy không thể chuyển sang đã thanh toán' },
+            { from: OrderStatus.CANCELLED, to: OrderStatus.PREPARING, desc: 'Đã hủy không thể chuyển sang pha chế' },
+            { from: OrderStatus.PENDING, to: OrderStatus.COMPLETED, desc: 'Chưa thanh toán/pha chế không thể nhảy cóc sang hoàn tất' },
+            { from: OrderStatus.PENDING, to: OrderStatus.READY, desc: 'Chưa pha chế không thể nhảy cóc sang mời nhận nước' },
+            { from: OrderStatus.PAID, to: OrderStatus.READY, desc: 'Đã thanh toán phải qua PREPARING mới tới READY' },
+        ];
+
+        invalidTransitions.forEach(({ from, to, desc }) => {
+            it(`Phải chặn: [${from} -> ${to}] (${desc})`, async () => {
+                (jest.spyOn(service, 'findOne') as any).mockResolvedValue({
+                    id: 1,
+                    status: from,
+                    orderItems: [],
+                });
+
+                await expect(service.update(1, { status: to })).rejects.toThrow(BadRequestException);
+            });
+        });
+    });
+
+    describe('2. Cho phép các bước chuyển trạng thái hợp lệ', () => {
+        const validTransitions = [
+            { from: OrderStatus.PENDING, to: OrderStatus.PAID },
+            { from: OrderStatus.PENDING, to: OrderStatus.PAYMENT_FAILED },
+            { from: OrderStatus.PENDING, to: OrderStatus.CANCELLED },
+            { from: OrderStatus.PAYMENT_FAILED, to: OrderStatus.PAID },
+            { from: OrderStatus.PAYMENT_FAILED, to: OrderStatus.CANCELLED },
+            { from: OrderStatus.PAID, to: OrderStatus.PREPARING },
+            { from: OrderStatus.PREPARING, to: OrderStatus.READY },
+            { from: OrderStatus.READY, to: OrderStatus.COMPLETED },
+        ];
+
+        validTransitions.forEach(({ from, to }) => {
+            it(`Cho phép: [${from} -> ${to}]`, async () => {
+                (jest.spyOn(service, 'findOne') as any).mockResolvedValue({
+                    id: 1,
+                    status: from,
+                    orderItems: [],
+                });
+
+                (mockPrisma.order.update as any).mockResolvedValue({
+                    id: 1,
+                    status: to,
+                    orderItems: [],
+                });
+
+                const result = await service.update(1, { status: to });
+                expect(result.data.status).toBe(to);
+            });
+        });
+    });
+});
+
+
+==================== FILE: apps\api\src\orders\orders.controller.ts ====================
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+  Query,
+  Req,
+  UseGuards,
+  ParseIntPipe,
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
+import { Role } from '@prisma/client';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { OrdersService } from './orders.service';
+import { CreateOrderDto } from './dto/create-order.dto';
+import { UpdateOrderDto } from './dto/update-order.dto';
+import { QueryOrderDto } from './dto/query-order.dto';
+
+@ApiTags('orders')
+@Controller('orders')
+export class OrdersController {
+  constructor(private readonly ordersService: OrdersService) {}
+
+  // =========================================================================
+  // 1. DÀNH CHO KHÁCH HÀNG (CUSTOMER)
+  // =========================================================================
+
+  @Post()
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+        'Tạo đơn hàng mới (Task 6 & Task 7 - Tự động nhận diện User qua JWT Token)',
+  })
+  create(@Req() req: any, @Body() createOrderDto: CreateOrderDto) {
+    const currentUserId = req.user?.id || req.user?.userId || req.user?.sub;
+
+    if (!currentUserId) {
+      throw new BadRequestException(
+          'Không tìm thấy thông tin tài khoản! Vui lòng đăng nhập qua nút Authorize.',
+      );
+    }
+
+    return this.ordersService.create(currentUserId, createOrderDto);
+  }
+
+  @Get('me')
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Lấy lịch sử đơn hàng của chính tài khoản đăng nhập (Task 9)',
+  })
+  findMyOrders(@Req() req: any) {
+    const currentUserId = req.user?.id || req.user?.userId || req.user?.sub;
+
+    if (!currentUserId) {
+      throw new BadRequestException('Vui lòng đăng nhập để xem lịch sử đơn!');
+    }
+
+    return this.ordersService.findByUserId(currentUserId);
+  }
+
+  // =========================================================================
+  // 2. DÙNG CHUNG (ADMIN XEM HẾT, KHÁCH HÀNG CHỈ XEM ĐƠN CỦA MÌNH)
+  // =========================================================================
+
+  @Get(':id')
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Xem chi tiết đơn hàng theo mã ID (Admin hoặc Chủ đơn hàng)',
+  })
+  async findOne(@Req() req: any, @Param('id', ParseIntPipe) id: number) {
+    const order = await this.ordersService.findOne(id);
+    const user = req.user;
+    const currentUserId = user?.id || user?.userId || user?.sub;
+
+    // Chặn nếu không phải Admin và cũng không phải chủ sở hữu của đơn
+    if (user?.role !== Role.ADMIN && order.userId !== currentUserId) {
+      throw new ForbiddenException(
+          'Bạn không có quyền xem chi tiết đơn hàng của người khác!',
+      );
+    }
+
+    return order;
+  }
+
+  // =========================================================================
+  // 3. DÀNH RIÊNG CHO QUẢN TRỊ VIÊN (ADMIN ONLY)
+  // =========================================================================
+
+  @Get()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Lấy danh sách tất cả đơn hàng có phân trang & lọc',
+  })
+  findAll(@Query() query: QueryOrderDto) {
+    return this.ordersService.findAll(query);
+  }
+
+  @Patch(':id/status')
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+        'Cập nhật trạng thái đơn hàng (Task 10 - Order State Machine - Chỉ Admin)',
+  })
+  updateStatus(
+      @Param('id', ParseIntPipe) id: number,
+      @Body() updateOrderDto: UpdateOrderDto,
+  ) {
+    return this.ordersService.update(id, updateOrderDto);
+  }
+
+  @Patch(':id')
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Cập nhật thông tin đơn hàng (Chỉ Admin)' })
+  update(
+      @Param('id', ParseIntPipe) id: number,
+      @Body() updateOrderDto: UpdateOrderDto,
+  ) {
+    return this.ordersService.update(id, updateOrderDto);
+  }
+
+  @Delete(':id')
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Xóa đơn hàng (Chỉ Admin)' })
+  remove(@Param('id', ParseIntPipe) id: number) {
+    return this.ordersService.remove(id);
+  }
+}
+
+
+==================== FILE: apps\api\src\orders\orders.module.ts ====================
+import { Module } from '@nestjs/common';
+import { OrdersService } from './orders.service';
+import { OrdersController } from './orders.controller';
+import { PrismaModule } from '../prisma/prisma.module';
+import { NotificationsModule } from '../notifications/notifications.module'; // <-- Import module này
+
+@Module({
+  imports: [PrismaModule, NotificationsModule], // <-- Đặt NotificationsModule vào đây
+  controllers: [OrdersController],
+  providers: [OrdersService],
+  exports: [OrdersService],
+})
+export class OrdersModule {}
+
+
+==================== FILE: apps\api\src\orders\orders.service.ts ====================
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+  Logger,
+} from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { PrismaService } from '../prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { CreateOrderDto } from './dto/create-order.dto';
+import { UpdateOrderDto } from './dto/update-order.dto';
+import { QueryOrderDto } from './dto/query-order.dto';
+import {
+  OrderStatus,
+  DiscountType,
+} from '@prisma/client';
+
+@Injectable()
+export class OrdersService {
+  private readonly logger = new Logger(OrdersService.name);
+
+  constructor(
+      private prisma: PrismaService,
+      private notificationsService: NotificationsService,
+  ) {}
+
+  // =========================================================================
+  // TASK 10 (Yêu cầu 1): ORDER STATE MACHINE CHUẨN MỤC 9.1
+  // =========================================================================
+  private readonly allowedTransitions: Record<OrderStatus, OrderStatus[]> = {
+    [OrderStatus.PENDING]: [
+      OrderStatus.PAID,
+      OrderStatus.PAYMENT_FAILED,
+      OrderStatus.CANCELLED,
+    ],
+    // Cho phép thanh toán lại chuyển thẳng sang PAID hoặc tự động huỷ sang CANCELLED
+    [OrderStatus.PAYMENT_FAILED]: [
+      OrderStatus.PENDING,
+      OrderStatus.PAID,
+      OrderStatus.CANCELLED,
+    ],
+    [OrderStatus.PAID]: [OrderStatus.PREPARING, OrderStatus.CANCELLED],
+    [OrderStatus.PREPARING]: [OrderStatus.READY],
+    [OrderStatus.READY]: [OrderStatus.COMPLETED],
+    [OrderStatus.COMPLETED]: [],
+    [OrderStatus.CANCELLED]: [],
+  };
+
+  private assertTransition(current: OrderStatus, next: OrderStatus): void {
+    const allowed = this.allowedTransitions[current] || [];
+    if (!allowed.includes(next)) {
+      throw new BadRequestException(
+          `Chuyển trạng thái không hợp lệ: Không thể chuyển từ [${current}] sang [${next}]!`,
+      );
+    }
+  }
+
+  // =========================================================================
+  // CRON JOB: TỰ ĐỘNG HỦY ĐƠN PENDING & PAYMENT_FAILED QUÁ 15 PHÚT
+  // =========================================================================
+  @Cron(CronExpression.EVERY_MINUTE)
+  async autoCancelExpiredPendingOrders() {
+    const EXPIRE_MINUTES = 15;
+    const thresholdTime = new Date(Date.now() - EXPIRE_MINUTES * 60 * 1000);
+
+    // 1. Tìm các đơn PENDING hoặc PAYMENT_FAILED tạo trước ngưỡng 15 phút
+    const expiredOrders = await this.prisma.order.findMany({
+      where: {
+        status: { in: [OrderStatus.PENDING, OrderStatus.PAYMENT_FAILED] },
+        createdAt: { lte: thresholdTime },
+      },
+      select: { id: true },
+    });
+
+    if (expiredOrders.length === 0) return;
+
+    this.logger.warn(
+        `Phát hiện ${expiredOrders.length} đơn hàng PENDING/PAYMENT_FAILED quá hạn ${EXPIRE_MINUTES} phút. Đang xử lý tự động hủy...`,
+    );
+
+    // 2. Chuyển sang CANCELLED (tự động hoàn tồn kho, hoàn coupon và gửi thông báo)
+    for (const item of expiredOrders) {
+      try {
+        await this.update(item.id, { status: OrderStatus.CANCELLED });
+        this.logger.log(
+            `Đã tự động hủy đơn #${item.id} và hoàn trả tồn kho thành công.`,
+        );
+      } catch (err: any) {
+        this.logger.error(
+            `Lỗi khi tự động hủy đơn #${item.id}: ${err.message}`,
+        );
+      }
+    }
+  }
+
+  // =========================================================================
+  // TASK 6 & TASK 10: TẠO ĐƠN HÀNG, KIỂM TRA TOPPING, TỒN KHO & COUPON
+  // =========================================================================
+  async create(userId: number, createOrderDto: CreateOrderDto) {
+    const { items, couponCode } = createOrderDto;
+
+    return this.prisma.$transaction(async (tx) => {
+      // 1. Kiểm tra tài khoản User & Trạng thái hoạt động
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+      });
+      if (!user) {
+        throw new NotFoundException(`Khách hàng #${userId} không tồn tại!`);
+      }
+      if (!user.isActive) {
+        throw new BadRequestException(
+            'Tài khoản của bạn đã bị khóa hoặc tạm ngưng hoạt động!',
+        );
+      }
+
+      let subtotal = 0;
+      const orderItemsData: any[] = [];
+
+      // 2. Duyệt qua từng món trong giỏ hàng
+      for (const item of items) {
+        const product = await tx.product.findUnique({
+          where: { id: item.productId },
+          include: {
+            category: {
+              include: {
+                toppings: {
+                  where: { isAvailable: true },
+                },
+              },
+            },
+          },
+        });
+
+        if (!product) {
+          throw new NotFoundException(
+              `Sản phẩm #${item.productId} không tồn tại!`,
+          );
+        }
+
+        if (!product.isActive) {
+          throw new BadRequestException(
+              `Sản phẩm "${product.name}" hiện đã ngừng kinh doanh hoặc tạm thời hết phục vụ!`,
+          );
+        }
+
+        if (product.category && !product.category.isActive) {
+          throw new BadRequestException(
+              `Danh mục "${product.category.name}" hiện đang tạm ngừng phục vụ!`,
+          );
+        }
+
+        if (product.stock < item.quantity) {
+          throw new BadRequestException(
+              `Sản phẩm "${product.name}" không đủ tồn kho (Còn: ${product.stock}, yêu cầu: ${item.quantity})!`,
+          );
+        }
+
+        // TASK 10 (Yêu cầu 3): OPTIMISTIC LOCKING VỚI CỘT VERSION VÀ RÀNG BUỘC TỒN KHO
+        const updateResult = await tx.product.updateMany({
+          where: {
+            id: product.id,
+            version: product.version,
+            stock: { gte: item.quantity },
+          },
+          data: {
+            stock: { decrement: item.quantity },
+            version: { increment: 1 },
+          },
+        });
+
+        if (updateResult.count === 0) {
+          throw new ConflictException(
+              `Sản phẩm "${product.name}" vừa có biến động tồn kho do người khác đặt cùng lúc, vui lòng thử lại!`,
+          );
+        }
+
+        // 3. Tra cứu Size & Phụ thu
+        const targetSize = (item.size || 'M').toUpperCase();
+        const availableSizes = await tx.productSize.findMany({
+          where: { productId: product.id },
+        });
+
+        let productSize = availableSizes.find(
+            (s) => s.name.toUpperCase() === targetSize && s.isAvailable,
+        );
+
+        if (availableSizes.length > 0 && !productSize) {
+          throw new BadRequestException(
+              `Size "${targetSize}" không khả dụng cho sản phẩm "${product.name}"!`,
+          );
+        }
+
+        const sizeName = productSize ? productSize.name : targetSize;
+        const sizeSurcharge = productSize ? productSize.surcharge : 0;
+        const productSizeId = productSize ? productSize.id : null;
+
+        // 4. Xử lý Topping & Kiểm tra tính tương thích theo Danh mục
+        let toppingUnitPrice = 0;
+        const toppingsCreateData: any[] = [];
+
+        if (item.toppingIds && item.toppingIds.length > 0) {
+          const allowedToppings = product.category?.toppings || [];
+          const allowedToppingIds = new Set(allowedToppings.map((t) => t.id));
+
+          const hasInvalidTopping = item.toppingIds.some(
+              (id) => !allowedToppingIds.has(id),
+          );
+
+          if (hasInvalidTopping) {
+            throw new BadRequestException(
+                `Sản phẩm "${product.name}" thuộc danh mục "${product.category?.name || 'mặc định'}" không hỗ trợ các loại topping đã chọn!`,
+            );
+          }
+
+          const toppings = await tx.topping.findMany({
+            where: {
+              id: { in: item.toppingIds },
+              isAvailable: true,
+            },
+          });
+
+          if (toppings.length !== item.toppingIds.length) {
+            throw new BadRequestException(
+                `Có loại topping không tồn tại hoặc đã ngừng phục vụ!`,
+            );
+          }
+
+          for (const top of toppings) {
+            toppingUnitPrice += top.price;
+            toppingsCreateData.push({
+              toppingId: top.id,
+              toppingName: top.name,
+              price: top.price,
+              qty: 1,
+              lineTotal: top.price,
+            });
+          }
+        }
+
+        const singleCupPrice = product.price + sizeSurcharge + toppingUnitPrice;
+        const itemLineTotal = singleCupPrice * item.quantity;
+        subtotal += itemLineTotal;
+
+        orderItemsData.push({
+          productId: product.id,
+          productSizeId: productSizeId,
+          productName: product.name,
+          unitPrice: product.price,
+          sizeName: sizeName,
+          sizeSurcharge: sizeSurcharge,
+          qty: item.quantity,
+          lineTotal: itemLineTotal,
+          ...(toppingsCreateData.length > 0
+              ? {
+                toppings: {
+                  create: toppingsCreateData,
+                },
+              }
+              : {}),
+        });
+      }
+
+      // 5. Xử lý mã giảm giá Coupon
+      let discountAmount = 0;
+      let couponId: number | null = null;
+
+      if (couponCode) {
+        const coupon = await tx.coupon.findUnique({
+          where: { code: couponCode },
+        });
+
+        if (!coupon || !coupon.isActive) {
+          throw new BadRequestException(
+              `Mã giảm giá "${couponCode}" không tồn tại hoặc đã bị ngừng kích hoạt!`,
+          );
+        }
+
+        const now = new Date();
+        if (coupon.startsAt > now) {
+          throw new BadRequestException(
+              `Mã giảm giá "${couponCode}" chưa đến thời gian áp dụng!`,
+          );
+        }
+
+        if (coupon.expiresAt < now) {
+          throw new BadRequestException(
+              `Mã giảm giá "${couponCode}" đã hết hạn sử dụng!`,
+          );
+        }
+
+        if (coupon.usageLimit && coupon.usedCount >= coupon.usageLimit) {
+          throw new BadRequestException(
+              `Mã giảm giá "${couponCode}" đã hết lượt sử dụng!`,
+          );
+        }
+
+        if (subtotal < coupon.minOrderValue) {
+          throw new BadRequestException(
+              `Đơn hàng cần tối thiểu ${coupon.minOrderValue.toLocaleString('vi-VN')}đ để áp dụng mã này!`,
+          );
+        }
+
+        couponId = coupon.id;
+        if (coupon.type === DiscountType.PERCENT) {
+          discountAmount = Math.floor((subtotal * coupon.value) / 100);
+          if (coupon.maxDiscount && discountAmount > coupon.maxDiscount) {
+            discountAmount = coupon.maxDiscount;
+          }
+        } else {
+          discountAmount = coupon.value;
+        }
+        discountAmount = Math.min(discountAmount, subtotal);
+
+        await tx.coupon.update({
+          where: { id: coupon.id },
+          data: { usedCount: { increment: 1 } },
+        });
+      }
+
+      const finalAmount = Math.max(0, subtotal - discountAmount);
+      const pointsEarned = Math.floor(finalAmount / 10000);
+
+      // 6. Lưu đơn hàng
+      const newOrder = await tx.order.create({
+        data: {
+          userId: userId,
+          total: subtotal,
+          discountCode: couponCode || null,
+          discountAmount: discountAmount,
+          finalAmount: finalAmount,
+          loyaltyPointsEarned: pointsEarned,
+          couponId: couponId,
+          status: OrderStatus.PENDING,
+          orderItems: {
+            create: orderItemsData,
+          },
+        },
+        include: {
+          orderItems: {
+            include: {
+              product: true,
+              size: true,
+              toppings: true,
+            },
+          },
+          coupon: true,
+          user: { select: { id: true, name: true, email: true } },
+        },
+      });
+
+      // 7. Bắn thông báo Đơn mới cho Admin
+      await this.notificationsService.notifyOrderCreated(
+          {
+            id: newOrder.id,
+            userId: newOrder.userId,
+            finalAmount: newOrder.finalAmount,
+            user: newOrder.user,
+          },
+          tx,
+      );
+
+      // 8. Đồng bộ cảnh báo sắp hết hàng nếu tồn kho xuống thấp
+      await this.notificationsService.syncStockAlerts(
+          items.map((i) => i.productId),
+          tx,
+      );
+
+      return {
+        success: true,
+        message: 'Tạo đơn hàng thành công',
+        orderId: newOrder.id,
+        status: newOrder.status,
+        total: newOrder.total,
+        discountAmount: newOrder.discountAmount,
+        finalAmount: newOrder.finalAmount,
+        loyaltyPointsEarned: newOrder.loyaltyPointsEarned,
+        data: newOrder,
+      };
+    });
+  }
+
+  // =========================================================================
+  // TASK 9: TRA CỨU ĐƠN HÀNG
+  // =========================================================================
+  async findAll(query?: QueryOrderDto) {
+    const page = Number(query?.page) || 1;
+    const limit = Number(query?.limit) || 100;
+    const skip = (page - 1) * limit;
+
+    const where: any = {};
+    if (query?.status) where.status = query.status;
+    if (query?.userId) where.userId = Number(query.userId);
+
+    const [data, total] = await Promise.all([
+      this.prisma.order.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { id: 'desc' },
+        include: {
+          orderItems: {
+            include: {
+              product: true,
+              size: true,
+              toppings: true,
+            },
+          },
+          payments: true,
+          user: { select: { id: true, email: true, name: true } },
+        },
+      }),
+      this.prisma.order.count({ where }),
+    ]);
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async findOne(id: number) {
+    const order = await this.prisma.order.findUnique({
+      where: { id },
+      include: {
+        orderItems: {
+          include: {
+            product: true,
+            size: true,
+            toppings: true,
+          },
+        },
+        payments: true,
+        user: { select: { id: true, email: true, name: true } },
+      },
+    });
+
+    if (!order) {
+      throw new NotFoundException(`Không tìm thấy đơn hàng #${id}`);
+    }
+
+    return order;
+  }
+
+  async findByUserId(userId: number) {
+    return this.prisma.order.findMany({
+      where: { userId },
+      orderBy: { id: 'desc' },
+      include: {
+        orderItems: {
+          include: {
+            product: true,
+            size: true,
+            toppings: true,
+          },
+        },
+        payments: true,
+      },
+    });
+  }
+
+  // =========================================================================
+  // TASK 10 (Yêu cầu 1): CẬP NHẬT TRẠNG THÁI VÀ HOÀN TỒN KHO / ĐIỀU CHỈNH ĐIỂM
+  // =========================================================================
+  async update(id: number, updateOrderDto: UpdateOrderDto) {
+    const order = await this.findOne(id);
+
+    if (updateOrderDto.status) {
+      this.assertTransition(order.status, updateOrderDto.status);
+
+      return this.prisma.$transaction(async (tx) => {
+        // 1. NẾU HỦY ĐƠN (CANCELLED)
+        if (updateOrderDto.status === OrderStatus.CANCELLED) {
+          // 1.1. Hoàn lại tồn kho theo số lượng và tăng version (Optimistic Locking)
+          for (const item of order.orderItems) {
+            await tx.product.update({
+              where: { id: item.productId },
+              data: {
+                stock: { increment: item.qty },
+                version: { increment: 1 },
+              },
+            });
+          }
+
+          // 1.2. Hoàn lại 1 lượt dùng Coupon (nếu có áp mã)
+          if (order.couponId) {
+            await tx.coupon.update({
+              where: { id: order.couponId },
+              data: {
+                usedCount: { decrement: 1 },
+              },
+            });
+          }
+
+          // 1.3. THU HỒI ĐIỂM TÍCH LŨY: Áp dụng cho các đơn đã thanh toán trước khi hủy
+          const paidStatuses: OrderStatus[] = [
+            OrderStatus.PAID,
+            OrderStatus.PREPARING,
+            OrderStatus.READY,
+          ];
+          const wasPaid = paidStatuses.includes(order.status);
+
+          if (wasPaid && order.loyaltyPointsEarned > 0) {
+            const customer = await tx.user.findUnique({
+              where: { id: order.userId },
+              select: { loyaltyPoints: true },
+            });
+
+            const currentPoints = customer?.loyaltyPoints || 0;
+            const pointsToDeduct = Math.min(
+                currentPoints,
+                order.loyaltyPointsEarned,
+            );
+
+            if (pointsToDeduct > 0) {
+              await tx.user.update({
+                where: { id: order.userId },
+                data: {
+                  loyaltyPoints: { decrement: pointsToDeduct },
+                },
+              });
+            }
+          }
+        }
+
+        // 2. NẾU CHUYỂN SANG PAID -> Cộng điểm tích lũy vào tài khoản User
+        if (
+            updateOrderDto.status === OrderStatus.PAID &&
+            order.status !== OrderStatus.PAID
+        ) {
+          if (order.loyaltyPointsEarned > 0) {
+            await tx.user.update({
+              where: { id: order.userId },
+              data: {
+                loyaltyPoints: { increment: order.loyaltyPointsEarned },
+              },
+            });
+          }
+        }
+
+        // 3. TỰ ĐỘNG PHÁT SINH THÔNG BÁO CHO CẢ ADMIN VÀ KHÁCH HÀNG
+        await this.notificationsService.notifyOrderStatusChanged(
+            {
+              id: order.id,
+              userId: order.userId,
+              finalAmount: order.finalAmount,
+              user: order.user,
+            },
+            updateOrderDto.status,
+            tx,
+        );
+
+        // 4. Đồng bộ lại cảnh báo tồn kho nếu có hoàn kho (Hủy đơn)
+        if (updateOrderDto.status === OrderStatus.CANCELLED) {
+          await this.notificationsService.syncStockAlerts(
+              order.orderItems.map((item) => item.productId),
+              tx,
+          );
+        }
+
+        // 5. Cập nhật trạng thái đơn
+        const updatedOrder = await tx.order.update({
+          where: { id },
+          data: {
+            status: updateOrderDto.status,
+            ...(updateOrderDto.status === OrderStatus.CANCELLED
+                ? { loyaltyPointsEarned: 0 }
+                : {}),
+          },
+          include: {
+            orderItems: {
+              include: {
+                product: true,
+                size: true,
+                toppings: true,
+              },
+            },
+          },
+        });
+
+        return {
+          success: true,
+          message: `Đã cập nhật đơn hàng sang trạng thái [${updatedOrder.status}]`,
+          data: updatedOrder,
+        };
+      });
+    }
+
+    return {
+      success: true,
+      data: order,
+    };
+  }
+
+  async remove(id: number) {
+    await this.findOne(id);
+    return this.prisma.order.delete({ where: { id } });
+  }
+}
+
+
+==================== FILE: apps\api\src\orders\dto\create-order.dto.ts ====================
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  IsNotEmpty,
+  IsString,
+  IsOptional,
+  IsArray,
+  ValidateNested,
+  ArrayMinSize,
+  Min,
+  IsInt,
+} from 'class-validator';
+import { Type } from 'class-transformer';
+
+export class CreateOrderItemDto {
+  @ApiProperty({ example: 1, description: 'ID sản phẩm đồ uống' })
+  @IsNotEmpty({ message: 'Mã sản phẩm không được để trống' })
+  @IsInt({ message: 'Mã sản phẩm phải là số nguyên' })
+  productId: number;
+
+  @ApiPropertyOptional({ example: 'M', description: 'Size đồ uống (S, M, L)' })
+  @IsOptional()
+  @IsString()
+  size?: string;
+
+  @ApiProperty({ example: 2, description: 'Số lượng đặt mua', minimum: 1 })
+  @IsNotEmpty({ message: 'Số lượng không được để trống' })
+  @IsInt({ message: 'Số lượng phải là số nguyên' })
+  @Min(1, { message: 'Số lượng mua tối thiểu là 1' })
+  quantity: number;
+
+  @ApiPropertyOptional({
+    example: [1, 2],
+    description: 'Danh sách ID topping đi kèm',
+  })
+  @IsOptional()
+  @IsArray({ message: 'Topping IDs phải là một mảng số nguyên' })
+  @IsInt({ each: true, message: 'Mỗi topping ID phải là số nguyên' })
+  toppingIds?: number[];
+}
+
+export class CreateOrderDto {
+  @ApiPropertyOptional({
+    example: 'SUMMER20',
+    description: 'Mã giảm giá/khuyến mãi (bỏ trống nếu không dùng)',
+  })
+  @IsOptional()
+  @IsString()
+  couponCode?: string;
+
+  @ApiProperty({
+    type: [CreateOrderItemDto],
+    description: 'Danh sách sản phẩm trong giỏ hàng',
+  })
+  @IsArray({ message: 'Giỏ hàng phải là một danh sách sản phẩm' })
+  @ArrayMinSize(1, { message: 'Giỏ hàng phải có ít nhất 1 sản phẩm' })
+  @ValidateNested({ each: true })
+  @Type(() => CreateOrderItemDto)
+  items: CreateOrderItemDto[];
+}
+
+
+
+==================== FILE: apps\api\src\orders\dto\query-order.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsOptional, IsEnum, IsInt, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+import { OrderStatus } from '@prisma/client';
+
+export class QueryOrderDto {
+  @ApiPropertyOptional({
+    enum: OrderStatus,
+    description: 'Lọc theo trạng thái đơn hàng',
+  })
+  @IsOptional()
+  @IsEnum(OrderStatus, { message: 'Trạng thái đơn hàng không hợp lệ' })
+  status?: OrderStatus;
+
+  @ApiPropertyOptional({ example: 1, description: 'Lọc theo ID khách hàng' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  userId?: number;
+
+  @ApiPropertyOptional({ example: 1, default: 1, description: 'Số trang' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @ApiPropertyOptional({
+    example: 10,
+    default: 10,
+    description: 'Số lượng trên một trang',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  limit?: number = 10;
+}
+
+
+
+==================== FILE: apps\api\src\orders\dto\update-order.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsEnum, IsOptional } from 'class-validator';
+import { OrderStatus } from '@prisma/client';
+
+export class UpdateOrderDto {
+  @ApiPropertyOptional({
+    enum: OrderStatus,
+    description: 'Trạng thái mới của đơn hàng cần cập nhật',
+  })
+  @IsOptional()
+  @IsEnum(OrderStatus, { message: 'Trạng thái chuyển đổi không hợp lệ' })
+  status?: OrderStatus;
+}
+
+
+
+==================== FILE: apps\api\src\orders\entities\order.entity.ts ====================
+export class Order {}
+
+
+
+==================== FILE: apps\api\src\payments\payments-idempotency.spec.ts ====================
+import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { PaymentsService } from './payments.service';
+import { OrderStatus, PaymentStatus, PaymentMethod } from '@prisma/client';
+
+// Mock @nestjs/common để chặn Node nạp file Pure ESM
+jest.mock('@nestjs/common', () => ({
+    Injectable: () => (target: any) => target,
+    NotFoundException: class extends Error {},
+    BadRequestException: class extends Error {},
+    ConflictException: class extends Error {},
+}));
+
+describe('Tiêu chí (b): Idempotency Key - Chống tạo trùng lặp giao dịch', () => {
+    let service: PaymentsService;
+    let mockPrisma: any;
+
+    const mockOrderId = 100;
+    const mockIdempotencyKey = 'unique-uuid-key-12345';
+    const mockFinalAmount = 45000;
+
+    beforeEach(() => {
+        mockPrisma = {
+            payment: {
+                findUnique: jest.fn(),
+                create: jest.fn(),
+            },
+            order: {
+                findUnique: jest.fn(),
+                updateMany: jest.fn(),
+            },
+            user: {
+                update: jest.fn(),
+            },
+            notification: {
+                create: jest.fn(),
+            },
+            $transaction: jest.fn((cb: any) => cb(mockPrisma)),
+        };
+
+        service = new PaymentsService(mockPrisma);
+    });
+
+    it('Lần gọi 1: Chưa có key -> Ghi nhận thanh toán mới và trừ tiền/cộng điểm', async () => {
+        (mockPrisma.payment.findUnique as any).mockResolvedValue(null);
+
+        (mockPrisma.order.findUnique as any).mockResolvedValue({
+            id: mockOrderId,
+            status: OrderStatus.PENDING,
+            finalAmount: mockFinalAmount,
+            userId: 1,
+        });
+
+        (mockPrisma.order.updateMany as any).mockResolvedValue({ count: 1 });
+        (mockPrisma.payment.create as any).mockResolvedValue({
+            id: 1,
+            orderId: mockOrderId,
+            idempotencyKey: mockIdempotencyKey,
+            amount: mockFinalAmount,
+            status: PaymentStatus.SUCCESS,
+            method: PaymentMethod.WALLET,
+        });
+
+        const result: any = await service.create({
+            orderId: mockOrderId,
+            idempotencyKey: mockIdempotencyKey,
+            method: PaymentMethod.WALLET,
+            amount: mockFinalAmount,
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.isDuplicate).toBeUndefined();
+        expect(mockPrisma.payment.create).toHaveBeenCalledTimes(1);
+        expect(mockPrisma.user.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('Lần gọi 2 (Cùng key): Nhận diện trùng lặp -> Trả kết quả cũ, KHÔNG tạo record mới, KHÔNG cộng điểm lần 2', async () => {
+        const existingPaymentRecord = {
+            id: 1,
+            orderId: mockOrderId,
+            idempotencyKey: mockIdempotencyKey,
+            amount: mockFinalAmount,
+            status: PaymentStatus.SUCCESS,
+            method: PaymentMethod.WALLET,
+            order: { status: OrderStatus.PAID },
+        };
+        (mockPrisma.payment.findUnique as any).mockResolvedValue(existingPaymentRecord);
+
+        const result: any = await service.create({
+            orderId: mockOrderId,
+            idempotencyKey: mockIdempotencyKey,
+            method: PaymentMethod.WALLET,
+            amount: mockFinalAmount,
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.isDuplicate).toBe(true);
+        expect(result.message).toContain('Idempotent response');
+
+        expect(mockPrisma.payment.create).not.toHaveBeenCalled();
+        expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+});
+
+
+==================== FILE: apps\api\src\payments\payments.controller.ts ====================
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Param,
+  Headers,
+  Query,
+  UseGuards,
+  ParseIntPipe,
+  BadRequestException,
+} from '@nestjs/common';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiHeader,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
+import { PaymentsService } from './payments.service';
+import { CreatePaymentDto } from './dto/create-payment.dto';
+import { QueryPaymentDto } from './dto/query-payment.dto';
+
+@ApiTags('payments')
+@Controller('payments')
+export class PaymentsController {
+  constructor(private readonly paymentsService: PaymentsService) {}
+
+  @Post()
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+        'Xử lý thanh toán không tiền mặt (Mock Gateway, Idempotent, State Machine)',
+  })
+  @ApiHeader({
+    name: 'idempotency-key',
+    required: false,
+    description:
+        'Idempotency Key (Có thể gửi qua HTTP Header hoặc bên trong Body)',
+  })
+  create(
+      @Body() createPaymentDto: CreatePaymentDto,
+      @Headers('idempotency-key') headerKey?: string,
+  ) {
+    const key = createPaymentDto.idempotencyKey || headerKey;
+    if (!key) {
+      throw new BadRequestException(
+          'Bắt buộc phải cung cấp Idempotency-Key qua HTTP Header hoặc Body!',
+      );
+    }
+    createPaymentDto.idempotencyKey = key;
+    return this.paymentsService.create(createPaymentDto);
+  }
+
+  @Get()
+  @ApiOperation({
+    summary: 'Lấy danh sách giao dịch thanh toán (có phân trang & lọc)',
+  })
+  findAll(@Query() query: QueryPaymentDto) {
+    return this.paymentsService.findAll(query);
+  }
+
+  @Get(':id')
+  @ApiOperation({ summary: 'Xem chi tiết giao dịch thanh toán theo ID' })
+  findOne(@Param('id', ParseIntPipe) id: number) {
+    return this.paymentsService.findOne(id);
+  }
+
+  @Get('order/:orderId')
+  @ApiOperation({ summary: 'Tra cứu lịch sử thanh toán theo mã đơn hàng' })
+  findByOrderId(@Param('orderId', ParseIntPipe) orderId: number) {
+    return this.paymentsService.findByOrderId(orderId);
+  }
+}
+
+
+==================== FILE: apps\api\src\payments\payments.module.ts ====================
+import { Module } from '@nestjs/common';
+import { PaymentsService } from './payments.service';
+import { PaymentsController } from './payments.controller';
+import { PrismaModule } from '../prisma/prisma.module';
+
+@Module({
+  imports: [PrismaModule],
+  controllers: [PaymentsController],
+  providers: [PaymentsService],
+  exports: [PaymentsService],
+})
+export class PaymentsModule {}
+
+
+
+==================== FILE: apps\api\src\payments\payments.service.ts ====================
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreatePaymentDto } from './dto/create-payment.dto';
+import { QueryPaymentDto } from './dto/query-payment.dto';
+import {
+  OrderStatus,
+  PaymentMethod,
+  PaymentStatus,
+  NotificationType,
+  NotificationAudience,
+  Prisma,
+} from '@prisma/client';
+
+@Injectable()
+export class PaymentsService {
+  constructor(private prisma: PrismaService) {}
+
+  async create(createPaymentDto: CreatePaymentDto) {
+    const { orderId, idempotencyKey, method, simulateFailure } =
+        createPaymentDto;
+
+    // 1. KIỂM TRA IDEMPOTENCY TRƯỚC (Task 10 - Yêu cầu 2)
+    const existingPayment = await this.prisma.payment.findUnique({
+      where: { idempotencyKey: idempotencyKey! },
+      include: { order: true },
+    });
+
+    if (existingPayment) {
+      return {
+        success: existingPayment.status === PaymentStatus.SUCCESS,
+        message:
+            existingPayment.status === PaymentStatus.SUCCESS
+                ? 'Thanh toán đã được xử lý thành công trước đó (Idempotent response)'
+                : 'Giao dịch này đã từng thất bại trước đó (Idempotent response)',
+        isDuplicate: true,
+        orderStatus: existingPayment.order?.status,
+        data: existingPayment,
+      };
+    }
+
+    // 2. TÌM ĐƠN HÀNG VÀ KIỂM TRA SƠ BỘ (Task 10 - Yêu cầu 1)
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      include: { user: true },
+    });
+
+    if (!order) {
+      throw new NotFoundException(`Không tìm thấy đơn hàng #${orderId}`);
+    }
+
+    if (order.status === OrderStatus.PAID) {
+      throw new ConflictException(
+          'Đơn hàng này đã được thanh toán thành công!',
+      );
+    }
+    if (order.status === OrderStatus.CANCELLED) {
+      throw new BadRequestException(
+          'Không thể thanh toán cho đơn hàng đã bị hủy!',
+      );
+    }
+    if (order.status === OrderStatus.COMPLETED) {
+      throw new BadRequestException(
+          'Không thể thanh toán cho đơn hàng đã hoàn tất!',
+      );
+    }
+
+    if (
+        order.status !== OrderStatus.PENDING &&
+        order.status !== OrderStatus.PAYMENT_FAILED
+    ) {
+      throw new BadRequestException(
+          `Không thể thanh toán: Đơn hàng đang ở trạng thái [${order.status}], chỉ cho phép thanh toán khi PENDING hoặc PAYMENT_FAILED!`,
+      );
+    }
+
+    const paymentAmount = order.finalAmount;
+    if (
+        createPaymentDto.amount &&
+        createPaymentDto.amount < order.finalAmount
+    ) {
+      throw new BadRequestException(
+          `Số tiền thanh toán (${createPaymentDto.amount}đ) không đủ so với tổng cần thanh toán (${order.finalAmount}đ)!`,
+      );
+    }
+
+    const transactionId = `TXN_${Date.now()}_${Math.floor(1000 + Math.random() * 9000)}`;
+
+    // 3. MOCK PAYMENT: GIẢ LẬP THẤT BẠI (Có bọc catch P2002)
+    if (simulateFailure) {
+      try {
+        return await this.prisma.$transaction(async (tx) => {
+          const updateOrder = await tx.order.updateMany({
+            where: {
+              id: orderId,
+              status: { in: [OrderStatus.PENDING, OrderStatus.PAYMENT_FAILED] },
+            },
+            data: { status: OrderStatus.PAYMENT_FAILED },
+          });
+
+          if (updateOrder.count === 0) {
+            throw new ConflictException(
+                'Trạng thái đơn hàng đã thay đổi bởi một giao dịch khác!',
+            );
+          }
+
+          const failedPayment = await tx.payment.create({
+            data: {
+              orderId: order.id,
+              idempotencyKey: idempotencyKey!,
+              amount: paymentAmount,
+              method: method as PaymentMethod,
+              status: PaymentStatus.FAILED,
+              transactionId,
+            },
+          });
+
+          // Thông báo cho Admin
+          await tx.notification.create({
+            data: {
+              audience: NotificationAudience.ADMIN,
+              type: NotificationType.PAYMENT_FAILED,
+              title: `Thanh toán thất bại cho đơn #${order.id}`,
+              message: `Khách hàng thanh toán không thành công qua ${method} số tiền ${paymentAmount.toLocaleString('vi-VN')}đ`,
+              orderId: order.id,
+            },
+          });
+
+          // Thông báo cho Khách hàng để xuất hiện trên chuông thông báo
+          if (order.userId) {
+            await tx.notification.create({
+              data: {
+                audience: NotificationAudience.CUSTOMER,
+                userId: order.userId,
+                type: NotificationType.PAYMENT_FAILED,
+                title: `Đơn #${order.id}: Thanh toán thất bại`,
+                message: `Giao dịch thanh toán chưa hoàn tất. Bạn có thể bấm vào đây để thanh toán lại!`,
+                orderId: order.id,
+              },
+            });
+          }
+
+          return {
+            success: false,
+            message:
+                'Giao dịch thanh toán thất bại từ cổng thanh toán giả lập!',
+            orderStatus: OrderStatus.PAYMENT_FAILED,
+            data: failedPayment,
+          };
+        });
+      } catch (error) {
+        if (
+            error instanceof Prisma.PrismaClientKnownRequestError &&
+            error.code === 'P2002'
+        ) {
+          const racePayment = await this.prisma.payment.findUnique({
+            where: { idempotencyKey: idempotencyKey! },
+          });
+          return {
+            success: false,
+            message: 'Giao dịch thất bại (Idempotent concurrent response)',
+            isDuplicate: true,
+            data: racePayment,
+          };
+        }
+        throw error;
+      }
+    }
+
+    // 4. MOCK PAYMENT: NHÁNH THÀNH CÔNG (Khóa nguyên tử atomic update)
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const pointsEarned = Math.floor(paymentAmount / 10000);
+
+        const updateOrderResult = await tx.order.updateMany({
+          where: {
+            id: order.id,
+            status: { in: [OrderStatus.PENDING, OrderStatus.PAYMENT_FAILED] },
+          },
+          data: {
+            status: OrderStatus.PAID,
+            loyaltyPointsEarned: pointsEarned,
+          },
+        });
+
+        if (updateOrderResult.count === 0) {
+          throw new ConflictException(
+              'Đơn hàng này vừa được thanh toán thành công bởi một tiến trình khác!',
+          );
+        }
+
+        const payment = await tx.payment.create({
+          data: {
+            orderId: order.id,
+            idempotencyKey: idempotencyKey!,
+            amount: paymentAmount,
+            method: method as PaymentMethod,
+            status: PaymentStatus.SUCCESS,
+            transactionId,
+          },
+        });
+
+        if (order.userId && pointsEarned > 0) {
+          await tx.user.update({
+            where: { id: order.userId },
+            data: {
+              loyaltyPoints: { increment: pointsEarned },
+            },
+          });
+        }
+
+        // Thông báo cho Admin
+        await tx.notification.create({
+          data: {
+            audience: NotificationAudience.ADMIN,
+            type: NotificationType.ORDER_UPDATE,
+            title: `Đơn hàng #${order.id} đã thanh toán thành công`,
+            message: `Nhận ${paymentAmount.toLocaleString('vi-VN')}đ qua ${method}. Mời Barista bắt đầu pha chế!`,
+            orderId: order.id,
+          },
+        });
+
+        // Thông báo cho Khách hàng
+        if (order.userId) {
+          await tx.notification.create({
+            data: {
+              audience: NotificationAudience.CUSTOMER,
+              userId: order.userId,
+              type: NotificationType.ORDER_UPDATE,
+              title: `Đơn #${order.id}: Đã thanh toán thành công`,
+              message: `Đơn hàng của bạn đã được chuyển tới quầy pha chế!`,
+              orderId: order.id,
+            },
+          });
+        }
+
+        return {
+          success: true,
+          message: 'Thanh toán thành công qua cổng thanh toán không tiền mặt',
+          orderStatus: OrderStatus.PAID,
+          data: payment,
+          loyaltyPointsEarned: pointsEarned,
+        };
+      });
+    } catch (error) {
+      if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002'
+      ) {
+        const racePayment = await this.prisma.payment.findUnique({
+          where: { idempotencyKey: idempotencyKey! },
+        });
+        return {
+          success: racePayment?.status === PaymentStatus.SUCCESS,
+          message: 'Thanh toán đã được xử lý (Idempotent concurrent response)',
+          isDuplicate: true,
+          data: racePayment,
+        };
+      }
+      throw error;
+    }
+  }
+
+  // Tích hợp phân trang và lọc chuẩn, ép kiểu Number an toàn
+  async findAll(query?: QueryPaymentDto) {
+    const page = Number(query?.page) || 1;
+    const limit = Number(query?.limit) || 20;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.PaymentWhereInput = {
+      ...(query?.method ? { method: query.method } : {}),
+    };
+
+    const [data, total] = await Promise.all([
+      this.prisma.payment.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { id: 'desc' },
+        include: {
+          order: {
+            select: {
+              id: true,
+              total: true,
+              finalAmount: true,
+              status: true,
+              user: { select: { id: true, name: true, email: true } },
+            },
+          },
+        },
+      }),
+      this.prisma.payment.count({ where }),
+    ]);
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async findOne(id: number) {
+    const payment = await this.prisma.payment.findUnique({
+      where: { id },
+      include: {
+        order: {
+          include: {
+            orderItems: true,
+            user: true,
+          },
+        },
+      },
+    });
+    if (!payment) {
+      throw new NotFoundException(`Không tìm thấy giao dịch thanh toán #${id}`);
+    }
+    return payment;
+  }
+
+  findByOrderId(orderId: number) {
+    return this.prisma.payment.findMany({
+      where: { orderId },
+      orderBy: { id: 'desc' },
+    });
+  }
+}
+
+
+==================== FILE: apps\api\src\payments\dto\create-payment.dto.ts ====================
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  IsNotEmpty,
+  IsNumber,
+  IsString,
+  IsOptional,
+  IsBoolean,
+  IsEnum,
+} from 'class-validator';
+import { PaymentMethod } from '@prisma/client';
+
+export class CreatePaymentDto {
+  @ApiProperty({ example: 1, description: 'ID của đơn hàng cần thanh toán' })
+  @IsNotEmpty({ message: 'Mã đơn hàng (orderId) không được để trống' })
+  @IsNumber({}, { message: 'Mã đơn hàng phải là số' })
+  orderId: number;
+
+  @ApiProperty({
+    example: 'WALLET',
+    description: 'Phương thức thanh toán không tiền mặt',
+    enum: PaymentMethod,
+  })
+  @IsNotEmpty({ message: 'Phương thức thanh toán không được để trống' })
+  @IsEnum(PaymentMethod, { message: 'Phương thức thanh toán không hợp lệ' })
+  method: PaymentMethod;
+
+  @ApiPropertyOptional({
+    example: 65000,
+    description:
+        'Số tiền thanh toán (bỏ trống sẽ tự động lấy finalAmount của đơn)',
+  })
+  @IsOptional()
+  @IsNumber({}, { message: 'Số tiền thanh toán phải là số' })
+  amount?: number;
+
+  @ApiPropertyOptional({
+    example: 'idem-uuid-9876-5432-10',
+    description:
+        'Idempotency-Key (Có thể truyền qua Body này hoặc qua HTTP Header)',
+  })
+  @IsOptional()
+  @IsString()
+  idempotencyKey?: string;
+
+  @ApiPropertyOptional({
+    example: false,
+    description: 'Bật true để giả lập lỗi cổng thanh toán',
+  })
+  @IsOptional()
+  @IsBoolean()
+  simulateFailure?: boolean;
+}
+
+
+==================== FILE: apps\api\src\payments\dto\query-payment.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsOptional, IsEnum, IsInt, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+import { PaymentMethod } from '@prisma/client';
+
+export class QueryPaymentDto {
+  @ApiPropertyOptional({
+    enum: PaymentMethod,
+    description: 'Lọc theo phương thức thanh toán',
+  })
+  @IsOptional()
+  @IsEnum(PaymentMethod)
+  method?: PaymentMethod;
+
+  @ApiPropertyOptional({ example: 1, default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @ApiPropertyOptional({ example: 10, default: 10 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  limit?: number = 10;
+}
+
+
+
+==================== FILE: apps\api\src\payments\dto\update-payment.dto.ts ====================
+import { PartialType } from '@nestjs/swagger';
+import { CreatePaymentDto } from './create-payment.dto';
+
+export class UpdatePaymentDto extends PartialType(CreatePaymentDto) {}
+
+
+
+==================== FILE: apps\api\src\payments\entities\payment.entity.ts ====================
+export class Payment {}
+
+
+
+==================== FILE: apps\api\src\coupons\coupons.controller.ts ====================
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+  ParseIntPipe,
+  UseGuards,
+  Query,
+  UseInterceptors,
+} from '@nestjs/common';
+import { CouponsService } from './coupons.service';
+import { CreateCouponDto } from './dto/create-coupon.dto';
+import { UpdateCouponDto } from './dto/update-coupon.dto';
+import { QueryCouponDto } from './dto/query-coupon.dto';
+import { ValidateCouponDto } from './dto/validate-coupon.dto';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiBearerAuth,
+  ApiConsumes,
+} from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { Role } from '@prisma/client';
+import { NoFilesInterceptor } from '@nestjs/platform-express';
+
+@ApiTags('Coupons (Mã giảm giá)')
+@Controller('coupons')
+export class CouponsController {
+  constructor(private readonly couponsService: CouponsService) {}
+
+  // ========================================================
+  // 1. PUBLIC API (Khách hàng)
+  // ========================================================
+
+  @Get('active')
+  @ApiOperation({ summary: 'Danh sách mã giảm giá đang hoạt động (Public)' })
+  findAllActive(@Query() query: QueryCouponDto) {
+    return this.couponsService.findAll(query, false);
+  }
+
+  @Post('validate')
+  @ApiOperation({
+    summary: 'Kiểm tra mã giảm giá và tính tiền giảm (Public - Task 10)',
+  })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(NoFilesInterceptor())
+  validateCoupon(@Body() validateCouponDto: ValidateCouponDto) {
+    return this.couponsService.validateCoupon(
+      validateCouponDto.code,
+      validateCouponDto.orderTotal,
+    );
+  }
+
+  // ========================================================
+  // 2. ADMIN API
+  // ========================================================
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Post()
+  @ApiOperation({ summary: 'Tạo mã giảm giá mới (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(NoFilesInterceptor())
+  create(@Body() createCouponDto: CreateCouponDto) {
+    return this.couponsService.create(createCouponDto);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get()
+  @ApiOperation({ summary: 'Lấy tất cả mã giảm giá kể cả bị ẩn (Admin)' })
+  findAll(@Query() query: QueryCouponDto) {
+    return this.couponsService.findAll(query, true);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get(':id')
+  @ApiOperation({ summary: 'Xem chi tiết mã giảm giá (Admin)' })
+  findOne(@Param('id', ParseIntPipe) id: number) {
+    return this.couponsService.findOne(id, true);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id')
+  @ApiOperation({ summary: 'Cập nhật mã giảm giá (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(NoFilesInterceptor())
+  update(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() updateCouponDto: UpdateCouponDto,
+  ) {
+    return this.couponsService.update(id, updateCouponDto);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Delete(':id')
+  @ApiOperation({ summary: 'Khóa / Ẩn mã giảm giá (Admin)' })
+  remove(@Param('id', ParseIntPipe) id: number) {
+    return this.couponsService.remove(id);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id/restore')
+  @ApiOperation({ summary: 'Khôi phục mã giảm giá (Admin)' })
+  restore(@Param('id', ParseIntPipe) id: number) {
+    return this.couponsService.restore(id);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\coupons\coupons.module.ts ====================
+import { Module } from '@nestjs/common';
+import { CouponsService } from './coupons.service';
+import { CouponsController } from './coupons.controller';
+
+@Module({
+  controllers: [CouponsController],
+  providers: [CouponsService],
+})
+export class CouponsModule {}
+
+
+
+==================== FILE: apps\api\src\coupons\coupons.service.ts ====================
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateCouponDto } from './dto/create-coupon.dto';
+import { UpdateCouponDto } from './dto/update-coupon.dto';
+import { QueryCouponDto } from './dto/query-coupon.dto';
+import { DiscountType } from '@prisma/client';
+
+@Injectable()
+export class CouponsService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(dto: CreateCouponDto) {
+    if (dto.startsAt >= dto.expiresAt) {
+      throw new BadRequestException(
+        'Thời gian kết thúc phải sau thời gian bắt đầu',
+      );
+    }
+    if (dto.type === DiscountType.PERCENT && dto.value > 100) {
+      throw new BadRequestException(
+        'Mức giảm theo phần trăm không được vượt quá 100%',
+      );
+    }
+
+    const existing = await this.prisma.coupon.findUnique({
+      where: { code: dto.code },
+    });
+
+    if (existing) {
+      throw new ConflictException(`Mã '${dto.code}' đã tồn tại!`);
+    }
+
+    return this.prisma.coupon.create({ data: dto });
+  }
+
+  async findAll(query: QueryCouponDto, includeHidden: boolean = false) {
+    const { search, page, limit } = query;
+    const skip = (page - 1) * limit;
+    const whereCondition: any = {};
+
+    if (!includeHidden) {
+      whereCondition.isActive = true;
+      whereCondition.expiresAt = { gt: new Date() };
+    }
+
+    if (search) {
+      whereCondition.code = { contains: search };
+    }
+
+    const [data, total] = await Promise.all([
+      this.prisma.coupon.findMany({
+        where: whereCondition,
+        skip,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.coupon.count({ where: whereCondition }),
+    ]);
+
+    return {
+      data,
+      meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+    };
+  }
+
+  async findOne(id: number, includeHidden: boolean = false) {
+    const coupon = await this.prisma.coupon.findUnique({ where: { id } });
+    if (!coupon || (!coupon.isActive && !includeHidden)) {
+      throw new NotFoundException(`Không tìm thấy mã giảm giá ID ${id}`);
+    }
+    return coupon;
+  }
+
+  async update(id: number, dto: UpdateCouponDto) {
+    const coupon = await this.findOne(id, true);
+
+    if (dto.code && dto.code !== coupon.code) {
+      const existing = await this.prisma.coupon.findUnique({
+        where: { code: dto.code },
+      });
+      if (existing) throw new ConflictException(`Mã '${dto.code}' đã tồn tại!`);
+    }
+
+    const checkStarts = dto.startsAt || coupon.startsAt;
+    const checkExpires = dto.expiresAt || coupon.expiresAt;
+    if (checkStarts >= checkExpires) {
+      throw new BadRequestException(
+        'Thời gian kết thúc phải sau thời gian bắt đầu',
+      );
+    }
+
+    return this.prisma.coupon.update({ where: { id }, data: dto });
+  }
+
+  async remove(id: number) {
+    await this.findOne(id, true);
+    return this.prisma.coupon.update({
+      where: { id },
+      data: { isActive: false },
+    });
+  }
+
+  async restore(id: number) {
+    await this.findOne(id, true);
+    return this.prisma.coupon.update({
+      where: { id },
+      data: { isActive: true },
+    });
+  }
+
+  /**
+   * ĐÁP ỨNG TASK 10 BREWLITE: XỬ LÝ KHUYẾN MÃI
+   */
+  async validateCoupon(code: string, orderTotal: number) {
+    const coupon = await this.prisma.coupon.findUnique({
+      where: { code: code.trim().toUpperCase() },
+    });
+
+    if (!coupon || !coupon.isActive) {
+      throw new BadRequestException(
+        'Mã giảm giá không tồn tại hoặc đã bị khóa',
+      );
+    }
+
+    const now = new Date();
+    if (now < coupon.startsAt) {
+      throw new BadRequestException(
+        'Mã giảm giá này chưa đến thời gian sử dụng',
+      );
+    }
+    if (now > coupon.expiresAt) {
+      throw new BadRequestException('Mã giảm giá này đã hết hạn');
+    }
+    if (coupon.usageLimit !== null && coupon.usedCount >= coupon.usageLimit) {
+      throw new BadRequestException('Mã giảm giá đã hết lượt sử dụng');
+    }
+    if (orderTotal < coupon.minOrderValue) {
+      throw new BadRequestException(
+        `Đơn hàng phải từ ${coupon.minOrderValue}đ để áp dụng mã này`,
+      );
+    }
+
+    let discountAmount = 0;
+    if (coupon.type === DiscountType.PERCENT) {
+      discountAmount = Math.floor((orderTotal * coupon.value) / 100);
+      if (coupon.maxDiscount) {
+        discountAmount = Math.min(discountAmount, coupon.maxDiscount);
+      }
+    } else {
+      discountAmount = coupon.value;
+    }
+
+    // Tiền giảm không bao giờ lớn hơn tổng giá trị đơn hàng
+    discountAmount = Math.min(discountAmount, orderTotal);
+
+    return {
+      isValid: true,
+      couponId: coupon.id,
+      code: coupon.code,
+      discountAmount,
+    };
+  }
+}
+
+
+
+==================== FILE: apps\api\src\coupons\dto\create-coupon.dto.ts ====================
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  IsString,
+  IsNotEmpty,
+  IsInt,
+  Min,
+  Max,
+  IsEnum,
+  IsOptional,
+  IsDate,
+  IsBoolean,
+  MinLength,
+  MaxLength,
+  Matches,
+  ValidateIf,
+} from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import { DiscountType } from '@prisma/client';
+
+export class CreateCouponDto {
+  @ApiProperty({ example: 'GIAM5K', description: 'Mã giảm giá' })
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value,
+  )
+  @IsString({ message: 'Mã giảm giá phải là chuỗi ký tự' })
+  @IsNotEmpty({ message: 'Mã giảm giá không được để trống' })
+  @MinLength(5, {
+    message: 'Mã giảm giá quá ngắn (tối thiểu 5 ký tự, VD: GIAM5K, SALE10K)',
+  })
+  @MaxLength(20, { message: 'Mã giảm giá không được vượt quá 20 ký tự' })
+  @Matches(/^[A-Z0-9]+$/, {
+    message:
+      'Mã giảm giá chỉ được chứa chữ cái in hoa và số (Không chứa dấu cách hay ký tự đặc biệt)',
+  })
+  code: string;
+
+  @ApiProperty({
+    enum: DiscountType,
+    description: 'Loại giảm giá (PERCENT hoặc FIXED)',
+  })
+  @IsEnum(DiscountType, {
+    message: 'Loại giảm giá không hợp lệ (Chỉ nhận PERCENT hoặc FIXED)',
+  })
+  type: DiscountType;
+
+  @ApiProperty({ example: 20000, description: 'Trị giá (VNĐ hoặc %)' })
+  @Type(() => Number)
+  @IsInt({ message: 'Trị giá giảm phải là số nguyên' })
+  @Min(1, { message: 'Trị giá giảm phải lớn hơn 0' })
+  @ValidateIf((o) => o.type === DiscountType.PERCENT)
+  @Max(100, { message: 'Mức giảm phần trăm không được vượt quá 100%' })
+  value: number;
+
+  @ApiProperty({ example: 30000, description: 'Giá trị đơn tối thiểu (VNĐ)' })
+  @Type(() => Number)
+  @IsInt({ message: 'Giá trị đơn tối thiểu phải là số nguyên' })
+  @Min(0, { message: 'Giá trị đơn tối thiểu không được nhỏ hơn 0' })
+  minOrderValue: number;
+
+  @ApiPropertyOptional({
+    example: 20000,
+    description: 'Giảm tối đa (nếu dùng %)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt({ message: 'Mức giảm tối đa phải là số nguyên' })
+  @Min(0, { message: 'Mức giảm tối đa không được nhỏ hơn 0' })
+  maxDiscount?: number;
+
+  @ApiPropertyOptional({
+    example: 100,
+    description: 'Giới hạn số lượt sử dụng',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt({ message: 'Giới hạn số lượt sử dụng phải là số nguyên' })
+  @Min(0, { message: 'Giới hạn số lượt sử dụng không được nhỏ hơn 0' })
+  usageLimit?: number;
+
+  @ApiProperty({
+    type: 'string',
+    example: '2026-10-05T16:11',
+    description: 'Ngày giờ bắt đầu áp dụng',
+  })
+  @Transform(({ value }) => new Date(value))
+  @IsDate({ message: 'Thời gian bắt đầu không hợp lệ' })
+  startsAt: Date;
+
+  @ApiProperty({
+    type: 'string',
+    example: '2026-10-30T23:59',
+    description: 'Ngày giờ hết hạn',
+  })
+  @Transform(({ value }) => new Date(value))
+  @IsDate({ message: 'Thời gian hết hạn không hợp lệ' })
+  expiresAt: Date;
+
+  @ApiPropertyOptional({ default: true, description: 'Trạng thái hoạt động' })
+  @IsOptional()
+  @Transform(({ value }) => value === 'true' || value === true)
+  @IsBoolean({ message: 'Trạng thái hoạt động phải là kiểu boolean' })
+  isActive?: boolean;
+}
+
+
+
+==================== FILE: apps\api\src\coupons\dto\query-coupon.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform, Type } from 'class-transformer';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+  MaxLength,
+} from 'class-validator';
+
+export class QueryCouponDto {
+  @ApiPropertyOptional({ description: 'Tìm theo mã code' })
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value,
+  )
+  @IsOptional()
+  @IsString({ message: 'Từ khóa tìm kiếm phải là một chuỗi' })
+  @MaxLength(50, { message: 'Từ khóa tìm kiếm quá dài (tối đa 50 ký tự)' })
+  search?: string;
+
+  @ApiPropertyOptional({ type: Number, default: 1 })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt({ message: 'Số trang (page) phải là số nguyên' })
+  @Min(1, { message: 'Số trang tối thiểu là 1' })
+  page: number = 1;
+
+  @ApiPropertyOptional({ type: Number, default: 20, maximum: 100 })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt({ message: 'Giới hạn (limit) phải là số nguyên' })
+  @Min(1, { message: 'Giới hạn tối thiểu là 1' })
+  @Max(100, { message: 'Giới hạn tối đa là 100 dòng mỗi trang' })
+  limit: number = 20;
+}
+
+
+
+==================== FILE: apps\api\src\coupons\dto\update-coupon.dto.ts ====================
+import { PartialType } from '@nestjs/swagger';
+import { CreateCouponDto } from './create-coupon.dto';
+
+export class UpdateCouponDto extends PartialType(CreateCouponDto) {}
+
+
+
+==================== FILE: apps\api\src\coupons\dto\validate-coupon.dto.ts ====================
+import { ApiProperty } from '@nestjs/swagger';
+import {
+  IsString,
+  IsNotEmpty,
+  IsInt,
+  Min,
+  MaxLength,
+  MinLength,
+  Matches,
+} from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+
+export class ValidateCouponDto {
+  @ApiProperty({
+    example: 'WELCOME10',
+    description: 'Mã giảm giá khách hàng nhập',
+  })
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value,
+  )
+  @IsString({ message: 'Mã giảm giá phải là một chuỗi ký tự' })
+  @IsNotEmpty({ message: 'Vui lòng nhập mã giảm giá' })
+  @MinLength(5, {
+    message: 'Mã giảm giá quá ngắn (tối thiểu 5 ký tự)',
+  })
+  @MaxLength(20, { message: 'Mã giảm giá không được vượt quá 20 ký tự' })
+  @Matches(/^[A-Z0-9]+$/, {
+    message:
+      'Mã giảm giá chỉ được chứa chữ cái in hoa và số (Không chứa dấu cách hay ký tự đặc biệt)',
+  })
+  code: string;
+
+  @ApiProperty({
+    example: 50000,
+    description: 'Tổng tiền đơn hàng hiện tại (VNĐ)',
+  })
+  @Type(() => Number)
+  @IsInt({ message: 'Tổng tiền đơn hàng phải là số nguyên' })
+  @Min(0, { message: 'Tổng tiền đơn hàng không hợp lệ (phải >= 0)' })
+  orderTotal: number;
+}
+
+
+
+==================== FILE: apps\api\src\coupons\entities\coupon.entity.ts ====================
+export class Coupon {}
+
+
+
+==================== FILE: apps\api\src\products\products.controller.ts ====================
+import {
+  applyDecorators,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  ParseIntPipe,
+  Patch,
+  Post,
+  Query,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { AuthGuard } from '@nestjs/passport';
+import {
+  ApiBearerAuth,
+  ApiConsumes,
+  ApiForbiddenResponse,
+  ApiOperation,
+  ApiTags,
+  ApiUnauthorizedResponse,
+} from '@nestjs/swagger';
+import { Role } from '@prisma/client';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { CreateProductDto } from './dto/create-product.dto';
+import { UpdateProductDto } from './dto/update-product.dto';
+import { QueryProductDto } from './dto/query-product.dto';
+import { imageUploadOptions } from '../common/upload/image-upload.options';
+import { ProductsService } from './products.service';
+
+/** Gom các decorator bắt buộc đăng nhập + quyền ADMIN cho một endpoint. */
+const AdminOnly = () =>
+  applyDecorators(
+    ApiBearerAuth(),
+    UseGuards(AuthGuard('jwt'), RolesGuard),
+    Roles(Role.ADMIN),
+    ApiUnauthorizedResponse({ description: 'Chưa đăng nhập' }),
+    ApiForbiddenResponse({ description: 'Không có quyền ADMIN' }),
+  );
+
+/** Bỏ field `file` khỏi DTO, gắn imageUrl nếu có upload. */
+function toInput<T extends { file?: unknown }>(
+  dto: T,
+  file?: Express.Multer.File,
+): Omit<T, 'file'> & { imageUrl?: string } {
+  const { file: _ignored, ...data } = dto;
+  return file ? { ...data, imageUrl: `/uploads/${file.filename}` } : data;
+}
+
+@ApiTags('Products (Thực đơn)')
+@Controller()
+export class ProductsController {
+  constructor(private readonly productsService: ProductsService) {}
+
+  // ========================================================
+  // 1. PUBLIC (khách hàng)
+  // ========================================================
+
+  @Get('products')
+  @ApiOperation({ summary: 'Danh sách đồ uống đang bán (Public)' })
+  findAll(@Query() query: QueryProductDto) {
+    return this.productsService.findAll(query, false);
+  }
+
+  @Get('products/:id')
+  @ApiOperation({ summary: 'Chi tiết một đồ uống đang bán (Public)' })
+  findOne(@Param('id', ParseIntPipe) id: number) {
+    return this.productsService.findOne(id, false);
+  }
+
+  // ========================================================
+  // 2. ADMIN - đọc cả sản phẩm đã ẩn
+  // ========================================================
+
+  @Get('admin/products')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Danh sách đồ uống bao gồm ẩn (Admin)' })
+  findAllForAdmin(@Query() query: QueryProductDto) {
+    return this.productsService.findAll(query, true);
+  }
+
+  @Get('admin/products/:id')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Chi tiết đồ uống bao gồm đã ẩn (Admin)' })
+  findOneForAdmin(@Param('id', ParseIntPipe) id: number) {
+    return this.productsService.findOne(id, true);
+  }
+
+  // ========================================================
+  // 3. ADMIN - ghi
+  // ========================================================
+
+  @Post('products')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Thêm đồ uống mới (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('file', imageUploadOptions))
+  create(
+    @Body() dto: CreateProductDto,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    return this.productsService.create(toInput(dto, file));
+  }
+
+  @Patch('products/:id')
+  @AdminOnly()
+  @ApiOperation({ summary: 'Cập nhật đồ uống (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('file', imageUploadOptions))
+  update(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateProductDto,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    return this.productsService.update(id, toInput(dto, file));
+  }
+
+  @Delete('products/:id')
+  @AdminOnly()
+  @HttpCode(204)
+  @ApiOperation({ summary: 'Ẩn đồ uống (Admin)' })
+  async remove(@Param('id', ParseIntPipe) id: number): Promise<void> {
+    await this.productsService.remove(id);
+  }
+
+  @Post('products/:id/restore')
+  @AdminOnly()
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Khôi phục đồ uống đã ẩn (Admin)' })
+  restore(@Param('id', ParseIntPipe) id: number) {
+    return this.productsService.restore(id);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\products\products.module.ts ====================
+import { Module } from '@nestjs/common';
+import { ProductsService } from './products.service';
+import { ProductsController } from './products.controller';
+import { PrismaModule } from '../prisma/prisma.module';
+
+@Module({
+  imports: [PrismaModule],
+  controllers: [ProductsController],
+  providers: [ProductsService],
+})
+export class ProductsModule {}
+
+
+
+==================== FILE: apps\api\src\products\products.service.spec.ts ====================
+import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { NotFoundException } from '@nestjs/common';
+import { ProductsService } from './products.service';
+
+// Mock @nestjs/common để chặn Node nạp file Pure ESM
+jest.mock('@nestjs/common', () => {
+    class NotFoundException extends Error {
+        constructor(message = 'Not Found') {
+            super(message);
+            this.name = 'NotFoundException';
+        }
+    }
+    return {
+        Injectable: () => (target: any) => target,
+        Logger: class {
+            log() {}
+            warn() {}
+            error() {}
+        },
+        NotFoundException,
+        BadRequestException: class extends Error {},
+        ConflictException: class extends Error {},
+    };
+});
+
+describe('ProductsService (Task 4.3 MVP)', () => {
+    let service: ProductsService;
+    let mockPrisma: any;
+
+    beforeEach(() => {
+        mockPrisma = {
+            product: {
+                findMany: jest.fn(),
+                count: jest.fn(),
+                findFirst: jest.fn(),
+                findUnique: jest.fn(),
+            },
+            $transaction: jest.fn((input: any) =>
+                Array.isArray(input) ? Promise.all(input) : input(mockPrisma),
+            ),
+        };
+
+        service = new ProductsService(mockPrisma);
+    });
+
+    it('trả về danh sách thực đơn và thông tin phân trang (GET /products)', async () => {
+        const mockProducts = [
+            {
+                id: 1,
+                name: 'Trà Lài Vải',
+                price: 30000,
+                isAvailable: true,
+                isActive: true,
+                sizes: [],
+                toppings: [],
+                category: { id: 1, name: 'Trà Trái Cây' },
+            },
+        ];
+        (mockPrisma.product.count as any).mockResolvedValue(1);
+        (mockPrisma.product.findMany as any).mockResolvedValue(mockProducts);
+
+        const result = await service.findAll({ page: 1, limit: 20 });
+
+        expect(result.data).toHaveLength(1);
+        expect(result.data[0]).toMatchObject({
+            id: 1,
+            name: 'Trà Lài Vải',
+            price: 30000,
+        });
+    });
+
+    it('trả về chi tiết sản phẩm hợp lệ (GET /products/:id)', async () => {
+        const mockProduct = {
+            id: 32,
+            name: 'Trà Lài Vải',
+            price: 30000,
+            isAvailable: true,
+        };
+        (mockPrisma.product.findFirst as any).mockResolvedValue(mockProduct);
+        (mockPrisma.product.findUnique as any).mockResolvedValue(mockProduct);
+
+        const result = await service.findOne(32);
+
+        expect(result).toBeDefined();
+        expect(result.name).toBe('Trà Lài Vải');
+    });
+
+    it('báo lỗi NotFoundException khi ID sản phẩm không tồn tại', async () => {
+        (mockPrisma.product.findFirst as any).mockResolvedValue(null);
+        (mockPrisma.product.findUnique as any).mockResolvedValue(null);
+
+        await expect(service.findOne(9999)).rejects.toThrow(NotFoundException);
+    });
+});
+
+
+==================== FILE: apps\api\src\products\products.service.ts ====================
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { promises as fs } from 'fs';
+import { basename, join } from 'path';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateProductDto } from './dto/create-product.dto';
+import { QueryProductDto } from './dto/query-product.dto';
+
+type SizeInput = { name: string; surcharge: number };
+
+/** Dữ liệu controller truyền xuống (đã bỏ field `file`, thêm `imageUrl` nếu có upload). */
+export type ProductInput = Omit<CreateProductDto, 'file'> & {
+  imageUrl?: string;
+};
+
+// Mặc định 3 size nếu thêm mới mà không nhập gì (theo chức năng BrewLite)
+const DEFAULT_SIZES: SizeInput[] = [
+  { name: 'S', surcharge: 0 },
+  { name: 'M', surcharge: 5000 },
+  { name: 'L', surcharge: 10000 },
+];
+
+// Chỉ trả các size đang bật
+const ACTIVE_SIZES = {
+  where: { isAvailable: true },
+  orderBy: { surcharge: Prisma.SortOrder.asc },
+  select: { id: true, name: true, surcharge: true },
+};
+
+// Khách hàng: Lấy chi tiết món, bao gồm version (Optimistic Locking) và Topping theo danh mục
+const PUBLIC_SELECT = {
+  id: true,
+  name: true,
+  price: true,
+  imageUrl: true,
+  description: true,
+  stock: true,
+  version: true, // Phục vụ kiểm tra Optimistic Locking (Task 10)
+  category: {
+    select: {
+      id: true,
+      name: true,
+      // Bổ sung lấy danh sách topping khả dụng được liên kết với danh mục món
+      toppings: {
+        where: { isAvailable: true },
+        select: { id: true, name: true, price: true, imageUrl: true },
+      },
+    },
+  },
+  sizes: ACTIVE_SIZES,
+};
+
+// Admin: thêm isActive, categoryId
+const ADMIN_SELECT = {
+  ...PUBLIC_SELECT,
+  isActive: true,
+  categoryId: true,
+};
+
+@Injectable()
+export class ProductsService {
+  constructor(private prisma: PrismaService) {}
+
+  // =========================================================
+  // Helpers
+  // =========================================================
+
+  /**
+   * Chuẩn hóa + kiểm tra danh sách size: trim tên, phụ thu >= 0, không trùng tên
+   * (không phân biệt hoa thường). Cho phép mảng rỗng.
+   */
+  private normalizeSizes(raw: unknown): SizeInput[] {
+    if (!Array.isArray(raw)) {
+      throw new BadRequestException('Danh sách size phải là một mảng');
+    }
+
+    const seen = new Set<string>();
+    const result: SizeInput[] = [];
+
+    for (const item of raw as any[]) {
+      const name = String(item?.name ?? '').trim();
+      const surcharge = Number(item?.surcharge ?? 0);
+
+      if (!name) {
+        throw new BadRequestException('Tên size không được để trống');
+      }
+      if (!Number.isInteger(surcharge) || surcharge < 0) {
+        throw new BadRequestException(
+          `Phụ thu của size "${name}" phải là số nguyên không âm`,
+        );
+      }
+
+      const key = name.toLowerCase();
+      if (seen.has(key)) {
+        throw new BadRequestException(`Size "${name}" bị trùng`);
+      }
+      seen.add(key);
+      result.push({ name, surcharge });
+    }
+    return result;
+  }
+
+  private async assertCategoryExists(categoryId?: number) {
+    if (categoryId === undefined || categoryId === null) return;
+    const category = await this.prisma.category.findUnique({
+      where: { id: categoryId },
+      select: { id: true },
+    });
+    if (!category) {
+      throw new BadRequestException(`Danh mục ID ${categoryId} không tồn tại`);
+    }
+  }
+
+  private async assertNameAvailable(name?: string, excludeId?: number) {
+    if (!name) return;
+    const existing = await this.prisma.product.findFirst({
+      where: {
+        name,
+        ...(excludeId !== undefined ? { id: { not: excludeId } } : {}),
+      },
+      select: { id: true },
+    });
+    if (existing) throw new ConflictException('Tên sản phẩm đã tồn tại');
+  }
+
+  /** Xóa file ảnh cũ trong ./uploads (bỏ qua ảnh mặc định default-*). */
+  private async deleteImageFile(imageUrl?: string | null) {
+    if (!imageUrl || !imageUrl.startsWith('/uploads/')) return;
+    const fileName = basename(imageUrl);
+    if (fileName.startsWith('default-')) return;
+    try {
+      await fs.unlink(join(process.cwd(), 'uploads', fileName));
+    } catch {
+      // File không còn tồn tại thì bỏ qua
+    }
+  }
+
+  // =========================================================
+  // Đọc
+  // =========================================================
+
+  async findAll(query: QueryProductDto, includeHidden = false) {
+    const { search, categoryId, page, limit } = query;
+
+    const where: Prisma.ProductWhereInput = {
+      ...(search ? { name: { contains: search } } : {}),
+      ...(categoryId ? { categoryId } : {}),
+      ...(includeHidden ? {} : { isActive: true }),
+    };
+
+    const [totalRecords, rawData] = await this.prisma.$transaction([
+      this.prisma.product.count({ where }),
+      this.prisma.product.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        select: includeHidden ? ADMIN_SELECT : PUBLIC_SELECT,
+        orderBy: { id: 'desc' },
+      }),
+    ]);
+
+    // Fallback: nếu sản phẩm chưa có size trong DB, tự động gắn S/M/L mặc định
+    const data = rawData.map((p) => ({
+      ...p,
+      sizes: p.sizes && p.sizes.length > 0 ? p.sizes : DEFAULT_SIZES,
+    }));
+
+    return {
+      data,
+      meta: {
+        totalRecords,
+        currentPage: page,
+        totalPages: Math.ceil(totalRecords / limit),
+        limit,
+      },
+    };
+  }
+
+  async findOne(id: number, includeHidden = false) {
+    const product = await this.prisma.product.findFirst({
+      where: { id, ...(includeHidden ? {} : { isActive: true }) },
+      select: includeHidden ? ADMIN_SELECT : PUBLIC_SELECT,
+    });
+
+    if (!product) {
+      throw new NotFoundException(
+        `Không tìm thấy sản phẩm ID ${id} hoặc đã ngừng bán`,
+      );
+    }
+
+    return {
+      ...product,
+      sizes:
+        product.sizes && product.sizes.length > 0
+          ? product.sizes
+          : DEFAULT_SIZES,
+    };
+  }
+
+  // =========================================================
+  // Thêm
+  // =========================================================
+
+  async create(data: ProductInput) {
+    const { sizes, ...productData } = data;
+
+    await this.assertNameAvailable(productData.name);
+    await this.assertCategoryExists(productData.categoryId);
+
+    // Không gửi hoặc để trống => mặc định S/M/L
+    const normalized = sizes === undefined ? [] : this.normalizeSizes(sizes);
+    const finalSizes =
+      normalized.length > 0 ? normalized : DEFAULT_SIZES.map((s) => ({ ...s }));
+
+    return this.prisma.product.create({
+      data: {
+        ...productData,
+        sizes: { create: finalSizes },
+      },
+      select: ADMIN_SELECT,
+    });
+  }
+
+  // =========================================================
+  // Sửa
+  // =========================================================
+
+  async update(id: number, data: Partial<ProductInput>) {
+    const current = await this.prisma.product.findUnique({
+      where: { id },
+      select: { id: true, imageUrl: true },
+    });
+    if (!current) {
+      throw new NotFoundException(`Không tìm thấy sản phẩm ID ${id}`);
+    }
+
+    const { sizes, ...productData } = data;
+
+    await this.assertNameAvailable(productData.name, id);
+    await this.assertCategoryExists(productData.categoryId);
+
+    let sizesOperation: Prisma.ProductUncheckedUpdateInput['sizes'];
+
+    if (sizes !== undefined) {
+      const incoming = this.normalizeSizes(sizes);
+      const existing = await this.prisma.productSize.findMany({
+        where: { productId: id },
+      });
+      const existingByName = new Map(
+        existing.map((s) => [s.name.toLowerCase(), s] as const),
+      );
+
+      const keepIds: number[] = [];
+      const toUpdate: {
+        where: { id: number };
+        data: { name: string; surcharge: number; isAvailable: boolean };
+      }[] = [];
+      const toCreate: SizeInput[] = [];
+
+      for (const size of incoming) {
+        const found = existingByName.get(size.name.toLowerCase());
+        if (found) {
+          keepIds.push(found.id);
+          toUpdate.push({
+            where: { id: found.id },
+            data: {
+              name: size.name,
+              surcharge: size.surcharge,
+              isAvailable: true,
+            },
+          });
+        } else {
+          toCreate.push(size);
+        }
+      }
+
+      sizesOperation = {
+        updateMany: {
+          where: { id: { notIn: keepIds } },
+          data: { isAvailable: false },
+        },
+        update: toUpdate,
+        create: toCreate,
+      };
+    }
+
+    // Đổi tồn kho thì tăng version để giao dịch đặt hàng đang chạy (optimistic locking, Task 10)
+    // phát hiện được và không ghi đè số lượng admin vừa sửa.
+    const stockChanged = productData.stock !== undefined;
+
+    const updated = await this.prisma.product.update({
+      where: { id },
+      data: {
+        ...productData,
+        ...(stockChanged ? { version: { increment: 1 } } : {}),
+        sizes: sizesOperation,
+      },
+      select: ADMIN_SELECT,
+    });
+
+    if (productData.imageUrl && current.imageUrl !== productData.imageUrl) {
+      await this.deleteImageFile(current.imageUrl);
+    }
+    return updated;
+  }
+
+  // =========================================================
+  // Ẩn / khôi phục (xóa mềm)
+  // =========================================================
+
+  async remove(id: number): Promise<void> {
+    const product = await this.prisma.product.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!product) {
+      throw new NotFoundException(`Không tìm thấy sản phẩm ID ${id}`);
+    }
+    await this.prisma.product.update({
+      where: { id },
+      data: { isActive: false },
+    });
+  }
+
+  async restore(id: number) {
+    const product = await this.prisma.product.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!product) {
+      throw new NotFoundException(`Không tìm thấy sản phẩm ID ${id}`);
+    }
+    return this.prisma.product.update({
+      where: { id },
+      data: { isActive: true },
+      select: ADMIN_SELECT,
+    });
+  }
+}
+
+
+
+==================== FILE: apps\api\src\products\dto\create-product.dto.ts ====================
+import { ApiProperty } from '@nestjs/swagger';
+import { BadRequestException } from '@nestjs/common';
+import {
+  IsString,
+  IsNotEmpty,
+  IsInt,
+  Min,
+  IsOptional,
+  Matches,
+  IsBoolean,
+  IsArray,
+  ArrayMaxSize,
+  MaxLength,
+  ValidateNested,
+} from 'class-validator';
+import { Transform, plainToInstance } from 'class-transformer';
+
+/** "29000" -> 29000. Giá trị lạ giữ nguyên để class-validator báo lỗi bằng message tiếng Việt. */
+const toNumber = ({ value }: { value: any }) =>
+  typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+
+/** "true"/"false" (multipart gửi chuỗi) -> boolean. Chuỗi rỗng coi như không gửi. */
+const toBoolean = ({ value }: { value: any }) => {
+  if (value === '' || value === null || value === undefined) return undefined;
+  if (value === true || value === 'true' || value === '1') return true;
+  if (value === false || value === 'false' || value === '0') return false;
+  return value;
+};
+
+export class ProductSizeDto {
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString({ message: 'Tên size phải là chuỗi' })
+  @IsNotEmpty({ message: 'Tên size không được để trống' })
+  @MaxLength(20, { message: 'Tên size tối đa 20 ký tự' })
+  name: string;
+
+  @Transform(toNumber)
+  @IsOptional()
+  @IsInt({ message: 'Phụ thu của size phải là số nguyên' })
+  @Min(0, { message: 'Phụ thu của size không được âm' })
+  surcharge?: number;
+}
+
+export class CreateProductDto {
+  @ApiProperty({ example: 'Cà phê sữa đá', description: 'Tên đồ uống' })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString({ message: 'Tên sản phẩm phải là chuỗi' })
+  @IsNotEmpty({ message: 'Tên sản phẩm không được để trống' })
+  @MaxLength(100, { message: 'Tên sản phẩm tối đa 100 ký tự' })
+  @Matches(
+    /^[a-zA-Z0-9\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]+$/,
+    {
+      message:
+        'Tên không được chứa ký tự đặc biệt (chỉ cho phép chữ cái, số và khoảng trắng)',
+    },
+  )
+  name: string;
+
+  @ApiProperty({ example: 29000, description: 'Giá bán (VNĐ)' })
+  @Transform(toNumber)
+  @IsInt({ message: 'Giá bán phải là số nguyên (VNĐ)' })
+  @Min(0, { message: 'Giá bán không được âm' })
+  price: number;
+
+  @ApiProperty({ example: 80, description: 'Số lượng tồn kho' })
+  @Transform(toNumber)
+  @IsInt({ message: 'Số lượng phải là số nguyên' })
+  @Min(0, { message: 'Số lượng không được âm' })
+  stock: number;
+
+  @ApiProperty({ example: 'Mô tả sản phẩm', required: false })
+  @IsOptional()
+  @IsString({ message: 'Mô tả phải là chuỗi' })
+  @MaxLength(1000, { message: 'Mô tả tối đa 1000 ký tự' })
+  description?: string;
+
+  @ApiProperty({ example: 1, description: 'ID danh mục', required: false })
+  @Transform(({ value }) =>
+    value === '' || value === null || value === undefined
+      ? undefined
+      : Number(value),
+  )
+  @IsOptional()
+  @IsInt({ message: 'ID danh mục phải là số nguyên' })
+  categoryId?: number;
+
+  @ApiProperty({
+    example: true,
+    required: false,
+    description: 'true = đang bán, false = ẩn',
+  })
+  @Transform(toBoolean)
+  @IsOptional()
+  @IsBoolean({ message: 'Trạng thái phải là true hoặc false' })
+  isActive?: boolean;
+
+  @ApiProperty({
+    type: 'string',
+    required: false,
+    description:
+      'Danh sách size dạng JSON array.\n' +
+      '- Thêm mới: để trống => mặc định S/M/L.\n' +
+      '- Cập nhật: không gửi trường này => giữ nguyên; để trống hoặc [] => ẩn toàn bộ size; ' +
+      'có giá trị => thay bằng danh sách mới (size không còn trong danh sách sẽ bị ẩn).',
+    example: `[
+  { "name": "S", "surcharge": 0 },
+  { "name": "M", "surcharge": 5000 },
+  { "name": "L", "surcharge": 10000 }
+]`,
+  })
+  @Transform(({ value }) => {
+    if (value === undefined || value === null) return undefined;
+
+    let raw = value;
+    if (typeof raw === 'string') {
+      // Chuỗi rỗng => mảng rỗng (khi cập nhật nghĩa là ẩn hết size)
+      if (raw.trim() === '') return [];
+      try {
+        raw = JSON.parse(raw);
+      } catch {
+        throw new BadRequestException(['Chuỗi JSON sizes không hợp lệ']);
+      }
+    }
+    // Chuyển thành instance để @ValidateNested kiểm tra từng phần tử
+    return Array.isArray(raw) ? plainToInstance(ProductSizeDto, raw) : raw;
+  })
+  @IsOptional()
+  @IsArray({ message: 'Sizes phải là một mảng' })
+  @ArrayMaxSize(10, { message: 'Tối đa 10 size cho mỗi sản phẩm' })
+  @ValidateNested({ each: true })
+  sizes?: ProductSizeDto[];
+
+  @ApiProperty({
+    type: 'string',
+    format: 'binary',
+    required: false,
+    description: 'Ảnh sản phẩm (jpg, png, webp, gif - tối đa 5MB)',
+  })
+  @IsOptional()
+  file?: any;
+}
+
+
+
+==================== FILE: apps\api\src\products\dto\query-product.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform, Type } from 'class-transformer';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
+
+export class QueryProductDto {
+  @ApiPropertyOptional({ description: 'Từ khóa tìm theo tên đồ uống' })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsOptional()
+  @IsString()
+  @MaxLength(100, { message: 'Từ khóa tối đa 100 ký tự' })
+  search?: string;
+
+  @ApiPropertyOptional({ type: Number, description: 'Lọc theo ID danh mục' })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt({ message: 'categoryId phải là số nguyên' })
+  @Min(1, { message: 'categoryId phải lớn hơn 0' })
+  categoryId?: number;
+
+  @ApiPropertyOptional({
+    type: Number,
+    default: 1,
+    description: 'Trang hiện tại',
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt({ message: 'page phải là số nguyên' })
+  @Min(1, { message: 'page phải từ 1 trở lên' })
+  page: number = 1;
+
+  @ApiPropertyOptional({
+    type: Number,
+    default: 20,
+    maximum: 100,
+    description: 'Số sản phẩm mỗi trang (tối đa 100)',
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt({ message: 'limit phải là số nguyên' })
+  @Min(1, { message: 'limit phải từ 1 trở lên' })
+  @Max(100, { message: 'limit tối đa 100' })
+  limit: number = 20;
+}
+
+
+
+==================== FILE: apps\api\src\products\dto\update-product.dto.ts ====================
+import { PartialType } from '@nestjs/swagger';
+import { CreateProductDto } from './create-product.dto';
+
+// Mọi trường đều optional, vẫn giữ nguyên validate + transform (kể cả sizes) của CreateProductDto
+export class UpdateProductDto extends PartialType(CreateProductDto) {}
+
+
+
+==================== FILE: apps\api\src\categories\categories.controller.ts ====================
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+  ParseIntPipe,
+  UseGuards,
+  UseInterceptors,
+  UploadedFile,
+  Query, // Thêm Query
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { CategoriesService } from './categories.service';
+import { CreateCategoryDto } from './dto/create-category.dto';
+import { UpdateCategoryDto } from './dto/update-category.dto';
+import { QueryCategoryDto } from './dto/query-category.dto'; // Import DTO
+import { imageUploadOptions } from '../common/upload/image-upload.options'; // Import cấu hình upload chung
+import {
+  ApiTags,
+  ApiOperation,
+  ApiBearerAuth,
+  ApiConsumes,
+} from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { Role } from '@prisma/client';
+
+@ApiTags('Categories (Danh mục)')
+@Controller('categories')
+export class CategoriesController {
+  constructor(private readonly categoriesService: CategoriesService) {}
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Post()
+  @ApiOperation({ summary: 'Thêm danh mục mới (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  // Sử dụng imageUploadOptions từ common
+  @UseInterceptors(FileInterceptor('file', imageUploadOptions))
+  create(
+    @Body() createCategoryDto: CreateCategoryDto,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    const { file: _, ...categoryData } = createCategoryDto as any;
+    if (file) {
+      categoryData.imageUrl = `/uploads/${file.filename}`;
+    }
+    return this.categoriesService.create(categoryData);
+  }
+
+  // ========================================================
+  // NHÓM API GET DÀNH CHO KHÁCH HÀNG (PUBLIC)
+  // ========================================================
+  @Get()
+  @ApiOperation({ summary: 'Lấy tất cả danh mục đang hoạt động (Public)' })
+  findAll(@Query() query: QueryCategoryDto) {
+    return this.categoriesService.findAll(query, false);
+  }
+
+  // ========================================================
+  // NHÓM API GET DÀNH CHO ADMIN
+  // Lưu ý: Đặt route có chữ tĩnh ('admin/all') lên trước route ':id'
+  // ========================================================
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get('admin/all')
+  @ApiOperation({ summary: 'Lấy tất cả danh mục kể cả bị ẩn (Chỉ Admin)' })
+  findAllForAdmin(@Query() query: QueryCategoryDto) {
+    return this.categoriesService.findAll(query, true);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get('admin/:id')
+  @ApiOperation({ summary: 'Xem chi tiết danh mục kể cả bị ẩn (Chỉ Admin)' })
+  findOneForAdmin(@Param('id', ParseIntPipe) id: number) {
+    return this.categoriesService.findOne(id, true);
+  }
+
+  // ========================================================
+  // CÁC ROUTE ĐỘNG CÒN LẠI (DÀNH CHO ID)
+  // ========================================================
+  @Get(':id')
+  @ApiOperation({ summary: 'Xem chi tiết một danh mục (Public)' })
+  findOne(@Param('id', ParseIntPipe) id: number) {
+    return this.categoriesService.findOne(id, false); // Trả về lỗi 404 nếu bị ẩn
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id')
+  @ApiOperation({ summary: 'Cập nhật danh mục (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  // Sử dụng imageUploadOptions từ common
+  @UseInterceptors(FileInterceptor('file', imageUploadOptions))
+  update(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() updateCategoryDto: UpdateCategoryDto,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    const { file: _, ...categoryData } = updateCategoryDto as any;
+    if (file) {
+      categoryData.imageUrl = `/uploads/${file.filename}`;
+    }
+    return this.categoriesService.update(id, categoryData);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Delete(':id')
+  @ApiOperation({ summary: 'Xóa danh mục / Ẩn danh mục (Admin)' })
+  remove(@Param('id', ParseIntPipe) id: number) {
+    return this.categoriesService.remove(id);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id/restore')
+  @ApiOperation({ summary: 'Khôi phục danh mục đã ẩn (Admin)' })
+  restore(@Param('id', ParseIntPipe) id: number) {
+    return this.categoriesService.restore(id);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\categories\categories.module.ts ====================
+import { Module } from '@nestjs/common';
+import { CategoriesService } from './categories.service';
+import { CategoriesController } from './categories.controller';
+
+@Module({
+  controllers: [CategoriesController],
+  providers: [CategoriesService],
+})
+export class CategoriesModule {}
+
+
+
+==================== FILE: apps\api\src\categories\categories.service.ts ====================
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { QueryCategoryDto } from './dto/query-category.dto'; // Thêm import DTO
+
+@Injectable()
+export class CategoriesService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(data: any) {
+    const existing = await this.prisma.category.findFirst({
+      where: { name: data.name },
+    });
+    if (existing) {
+      throw new ConflictException(
+        `Danh mục mang tên '${data.name}' đã tồn tại!`,
+      );
+    }
+    return this.prisma.category.create({ data });
+  }
+
+  // Hỗ trợ phân trang, tìm kiếm và phân tách quyền Admin / Public qua includeHidden
+  async findAll(query: QueryCategoryDto, includeHidden: boolean = false) {
+    const { search, page, limit } = query;
+    const skip = (page - 1) * limit;
+
+    // Xây dựng bộ lọc query
+    const whereCondition: any = {};
+
+    if (!includeHidden) {
+      whereCondition.isActive = true; // Public chỉ lấy danh mục đang hoạt động
+    }
+
+    if (search) {
+      whereCondition.name = { contains: search }; // Tìm gần đúng tên danh mục
+    }
+
+    // Chạy song song 2 lệnh: lấy dữ liệu (take/skip) và đếm tổng số bản ghi
+    const [data, total] = await Promise.all([
+      this.prisma.category.findMany({
+        where: whereCondition,
+        include: {
+          _count: { select: { products: true } },
+        },
+        skip,
+        take: limit,
+        orderBy: { id: 'desc' },
+      }),
+      this.prisma.category.count({ where: whereCondition }),
+    ]);
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  // Thêm cờ includeHidden
+  async findOne(id: number, includeHidden: boolean = false) {
+    const category = await this.prisma.category.findUnique({
+      where: { id },
+      include: {
+        products: {
+          // Khi khách hàng vào xem chi tiết danh mục, chỉ hiển thị sản phẩm đang bán
+          where: includeHidden ? undefined : { isActive: true },
+        },
+      },
+    });
+
+    if (!category || (!category.isActive && !includeHidden)) {
+      throw new NotFoundException(
+        `Không tìm thấy danh mục ID ${id} hoặc danh mục đã bị ẩn`,
+      );
+    }
+    return category;
+  }
+
+  async update(id: number, data: any) {
+    await this.findOne(id, true); // Cho phép Admin update cả danh mục bị ẩn
+
+    if (data.name) {
+      const existing = await this.prisma.category.findFirst({
+        where: {
+          name: data.name,
+          id: { not: id },
+        },
+      });
+      if (existing) {
+        throw new ConflictException(
+          `Danh mục mang tên '${data.name}' đã tồn tại!`,
+        );
+      }
+    }
+
+    return this.prisma.category.update({
+      where: { id },
+      data,
+    });
+  }
+
+  // Xóa mềm (Soft Delete)
+  async remove(id: number) {
+    const category = await this.prisma.category.findUnique({
+      where: { id },
+      include: {
+        _count: { select: { products: true } },
+      },
+    });
+
+    if (!category) {
+      throw new NotFoundException(`Không tìm thấy danh mục với ID ${id}`);
+    }
+
+    if (category._count.products > 0) {
+      throw new BadRequestException(
+        `Không thể xóa! Danh mục này đang chứa ${category._count.products} sản phẩm. Vui lòng chuyển các sản phẩm sang danh mục khác trước khi xóa.`,
+      );
+    }
+
+    return this.prisma.category.update({
+      where: { id },
+      data: { isActive: false },
+    });
+  }
+
+  // Tính năng KHÔI PHỤC (Restore)
+  async restore(id: number) {
+    await this.findOne(id, true); // Đảm bảo danh mục tồn tại
+
+    return this.prisma.category.update({
+      where: { id },
+      data: { isActive: true },
+    });
+  }
+}
+
+
+
+==================== FILE: apps\api\src\categories\dto\create-category.dto.ts ====================
+import { ApiProperty } from '@nestjs/swagger';
+import {
+  IsString,
+  IsNotEmpty,
+  IsOptional,
+  Matches,
+  IsBoolean,
+} from 'class-validator';
+import { Transform } from 'class-transformer';
+
+export class CreateCategoryDto {
+  @ApiProperty({ example: 'Cà phê pha máy', description: 'Tên danh mục' })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString({ message: 'Tên danh mục phải là chuỗi ký tự' })
+  @IsNotEmpty({ message: 'Tên danh mục không được để trống' })
+  @Matches(
+    /^[a-zA-Z0-9\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]+$/,
+    {
+      message:
+        'Tên không được chứa ký tự đặc biệt (chỉ cho phép chữ cái, số và khoảng trắng)',
+    },
+  )
+  name: string;
+
+  @ApiProperty({ example: 'Các loại cà phê', required: false })
+  @IsString({ message: 'Mô tả phải là chuỗi ký tự' })
+  @IsOptional()
+  description?: string;
+
+  @ApiProperty({
+    example: true,
+    required: false,
+    description: 'Trạng thái hoạt động',
+  })
+  @Transform(({ value }) => {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @IsOptional()
+  isActive?: boolean;
+
+  @ApiProperty({
+    type: 'string',
+    format: 'binary',
+    required: false,
+    description: 'Hình ảnh',
+  })
+  @IsOptional()
+  file?: any;
+}
+
+
+
+==================== FILE: apps\api\src\categories\dto\query-category.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform, Type } from 'class-transformer';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
+
+export class QueryCategoryDto {
+  @ApiPropertyOptional({ description: 'Từ khóa tìm kiếm theo tên danh mục' })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsOptional()
+  @IsString()
+  @MaxLength(100, { message: 'Từ khóa tối đa 100 ký tự' })
+  search?: string;
+
+  @ApiPropertyOptional({
+    type: Number,
+    default: 1,
+    description: 'Trang hiện tại',
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt({ message: 'page phải là số nguyên' })
+  @Min(1, { message: 'page phải từ 1 trở lên' })
+  page: number = 1;
+
+  @ApiPropertyOptional({
+    type: Number,
+    default: 20,
+    maximum: 100,
+    description: 'Số danh mục mỗi trang (tối đa 100)',
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt({ message: 'limit phải là số nguyên' })
+  @Min(1, { message: 'limit phải từ 1 trở lên' })
+  @Max(100, { message: 'limit tối đa 100' })
+  limit: number = 20;
+}
+
+
+
+==================== FILE: apps\api\src\categories\dto\update-category.dto.ts ====================
+import { PartialType } from '@nestjs/swagger';
+import { CreateCategoryDto } from './create-category.dto';
+
+export class UpdateCategoryDto extends PartialType(CreateCategoryDto) {}
+
+
+
+==================== FILE: apps\api\src\categories\entities\category.entity.ts ====================
+export class Category {}
+
+
+
+==================== FILE: apps\api\src\toppings\toppings.controller.ts ====================
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+  ParseIntPipe,
+  UseGuards,
+  Query,
+  UseInterceptors,
+  UploadedFile,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ToppingsService } from './toppings.service';
+import { CreateToppingDto } from './dto/create-topping.dto';
+import { UpdateToppingDto } from './dto/update-topping.dto';
+import { QueryToppingDto } from './dto/query-topping.dto';
+import { imageUploadOptions } from '../common/upload/image-upload.options';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiBearerAuth,
+  ApiConsumes,
+} from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { Role } from '@prisma/client';
+
+@ApiTags('Toppings (Món thêm)')
+@Controller('toppings')
+export class ToppingsController {
+  constructor(private readonly toppingsService: ToppingsService) {}
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Post()
+  @ApiOperation({ summary: 'Thêm Topping (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('file', imageUploadOptions))
+  create(
+    @Body() createToppingDto: CreateToppingDto,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    const { file: _, ...toppingData } = createToppingDto as any;
+    if (file) {
+      toppingData.imageUrl = `/uploads/${file.filename}`;
+    }
+    return this.toppingsService.create(toppingData);
+  }
+
+  // ========================================================
+  // 1. NHÓM API DÀNH CHO KHÁCH HÀNG (PUBLIC) - LẤY DANH SÁCH
+  // ========================================================
+
+  @Get()
+  @ApiOperation({ summary: 'Lấy danh sách Topping đang bán (Public)' })
+  findAll(@Query() query: QueryToppingDto) {
+    // Khách hàng tuyệt đối không thể xem topping đã ẩn
+    return this.toppingsService.findAll(query, false);
+  }
+
+  // ========================================================
+  // 2. NHÓM API DÀNH RIÊNG CHO ADMIN (Phải đặt trước các route :id)
+  // ========================================================
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get('admin/all')
+  @ApiOperation({ summary: 'Lấy tất cả Topping bao gồm ẩn (Chỉ Admin)' })
+  findAllForAdmin(@Query() query: QueryToppingDto) {
+    // Bật chế độ xem toàn bộ cho Admin
+    return this.toppingsService.findAll(query, true);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Get('admin/:id')
+  @ApiOperation({ summary: 'Xem chi tiết Topping bao gồm ẩn (Chỉ Admin)' })
+  findOneForAdmin(@Param('id', ParseIntPipe) id: number) {
+    return this.toppingsService.findOne(id, true);
+  }
+
+  // ========================================================
+  // 3. CÁC ROUTE CÓ THAM SỐ ĐỘNG DÀNH CHO CHI TIẾT / CẬP NHẬT / XÓA
+  // ========================================================
+
+  @Get(':id')
+  @ApiOperation({ summary: 'Xem chi tiết một Topping (Public)' })
+  findOne(@Param('id', ParseIntPipe) id: number) {
+    return this.toppingsService.findOne(id, false);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id')
+  @ApiOperation({ summary: 'Cập nhật Topping (Admin)' })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('file', imageUploadOptions))
+  update(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() updateToppingDto: UpdateToppingDto,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    const { file: _, ...toppingData } = updateToppingDto as any;
+    if (file) {
+      toppingData.imageUrl = `/uploads/${file.filename}`;
+    }
+    return this.toppingsService.update(id, toppingData);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Delete(':id')
+  @ApiOperation({ summary: 'Xóa Topping (Admin)' })
+  remove(@Param('id', ParseIntPipe) id: number) {
+    return this.toppingsService.remove(id);
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(AuthGuard('jwt'), RolesGuard)
+  @Roles(Role.ADMIN)
+  @Patch(':id/restore')
+  @ApiOperation({ summary: 'Khôi phục Topping đã ẩn (Admin)' })
+  restore(@Param('id', ParseIntPipe) id: number) {
+    return this.toppingsService.restore(id);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\toppings\toppings.module.ts ====================
+import { Module } from '@nestjs/common';
+import { ToppingsService } from './toppings.service';
+import { ToppingsController } from './toppings.controller';
+
+@Module({
+  controllers: [ToppingsController],
+  providers: [ToppingsService],
+})
+export class ToppingsModule {}
+
+
+
+==================== FILE: apps\api\src\toppings\toppings.service.ts ====================
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { QueryToppingDto } from './dto/query-topping.dto';
+
+@Injectable()
+export class ToppingsService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(dto: any) {
+    const existing = await this.prisma.topping.findFirst({
+      where: { name: dto.name },
+    });
+    if (existing) {
+      throw new ConflictException('Tên topping đã tồn tại!');
+    }
+
+    // Gom categoryId hoặc categoryIds vào danh sách ID duy nhất
+    let catIds: number[] = [];
+    if (dto.categoryId) {
+      catIds.push(Number(dto.categoryId));
+    }
+    if (Array.isArray(dto.categoryIds)) {
+      catIds.push(...dto.categoryIds.map(Number));
+    }
+    catIds = Array.from(new Set(catIds.filter((id) => !isNaN(id) && id > 0)));
+
+    const { categoryId, categoryIds, ...data } = dto;
+
+    return this.prisma.topping.create({
+      data: {
+        ...data,
+        categories:
+            catIds.length > 0
+                ? { connect: catIds.map((id) => ({ id })) }
+                : undefined,
+      },
+      include: {
+        categories: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+  }
+
+  // Hỗ trợ phân trang, tìm kiếm, lọc theo danh mục và trạng thái ẩn/hiện
+  async findAll(query: QueryToppingDto, includeHidden: boolean = false) {
+    const { search, categoryId, page = 1, limit = 50 } = query;
+    const skip = (page - 1) * limit;
+
+    const whereCondition: any = {};
+
+    if (!includeHidden) {
+      whereCondition.isAvailable = true;
+    }
+
+    if (search) {
+      whereCondition.name = { contains: search, mode: 'insensitive' };
+    }
+
+    if (categoryId) {
+      whereCondition.categories = {
+        some: { id: Number(categoryId) },
+      };
+    }
+
+    const [data, total] = await Promise.all([
+      this.prisma.topping.findMany({
+        where: whereCondition,
+        skip,
+        take: limit,
+        include: {
+          categories: {
+            select: { id: true, name: true },
+          },
+        },
+        orderBy: { id: 'desc' },
+      }),
+      this.prisma.topping.count({ where: whereCondition }),
+    ]);
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async findOne(id: number, includeHidden: boolean = false) {
+    const topping = await this.prisma.topping.findUnique({
+      where: { id },
+      include: {
+        categories: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+
+    if (!topping || (!topping.isAvailable && !includeHidden)) {
+      throw new NotFoundException(
+          `Không tìm thấy topping ID ${id} hoặc đã ngừng bán`,
+      );
+    }
+    return topping;
+  }
+
+  async update(id: number, dto: any) {
+    await this.findOne(id, true);
+
+    if (dto.name) {
+      const existing = await this.prisma.topping.findFirst({
+        where: { name: dto.name, id: { not: id } },
+      });
+      if (existing) {
+        throw new ConflictException('Tên topping đã tồn tại!');
+      }
+    }
+
+    const hasCategoryUpdate =
+        dto.categoryId !== undefined || dto.categoryIds !== undefined;
+
+    let catIds: number[] = [];
+    if (dto.categoryId) {
+      catIds.push(Number(dto.categoryId));
+    }
+    if (Array.isArray(dto.categoryIds)) {
+      catIds.push(...dto.categoryIds.map(Number));
+    }
+    catIds = Array.from(new Set(catIds.filter((cid) => !isNaN(cid) && cid > 0)));
+
+    const { categoryId, categoryIds, ...data } = dto;
+
+    return this.prisma.topping.update({
+      where: { id },
+      data: {
+        ...data,
+        categories: hasCategoryUpdate
+            ? { set: catIds.map((cid) => ({ id: cid })) }
+            : undefined,
+      },
+      include: {
+        categories: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+  }
+
+  async remove(id: number) {
+    await this.findOne(id, true);
+
+    return this.prisma.topping.update({
+      where: { id },
+      data: { isAvailable: false },
+      include: {
+        categories: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+  }
+
+  async restore(id: number) {
+    await this.findOne(id, true);
+
+    return this.prisma.topping.update({
+      where: { id },
+      data: { isAvailable: true },
+      include: {
+        categories: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+  }
+}
+
+
+==================== FILE: apps\api\src\toppings\dto\create-topping.dto.ts ====================
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  IsString,
+  IsNotEmpty,
+  IsInt,
+  Min,
+  IsBoolean,
+  IsOptional,
+  MaxLength,
+  Matches,
+  IsArray,
+} from 'class-validator';
+import { Transform } from 'class-transformer';
+
+export class CreateToppingDto {
+  @ApiProperty({ example: 'Trân châu đen', description: 'Tên topping' })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString({ message: 'Tên topping phải là chuỗi' })
+  @IsNotEmpty({ message: 'Tên topping không được để trống' })
+  @Matches(
+      /^[a-zA-Z0-9\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]+$/,
+      {
+        message:
+            'Tên không được chứa ký tự đặc biệt (chỉ cho phép chữ cái, số và khoảng trắng)',
+      },
+  )
+  @MaxLength(255, { message: 'Tên topping không được vượt quá 255 ký tự' })
+  name: string;
+
+  @ApiProperty({ example: 5000, description: 'Giá thêm (VNĐ)' })
+  @Transform(({ value }) =>
+      value !== undefined && value !== '' ? Number(value) : value,
+  )
+  @IsInt({ message: 'Giá topping phải là số nguyên' })
+  @Min(0, { message: 'Giá không được âm' })
+  price: number;
+
+  @ApiPropertyOptional({
+    example: true,
+    default: true,
+    description: 'Trạng thái bán',
+  })
+  @Transform(({ value }) => {
+    if (value === 'true' || value === true) return true;
+    if (value === 'false' || value === false) return false;
+    return value;
+  })
+  @IsBoolean()
+  @IsOptional()
+  isAvailable?: boolean;
+
+  @ApiPropertyOptional({
+    example: 1,
+    description: 'ID danh mục chọn từ Dropdown (giống Product)',
+  })
+  @Transform(({ value }) =>
+      value !== undefined && value !== '' && value !== null
+          ? Number(value)
+          : undefined,
+  )
+  @IsOptional()
+  categoryId?: number;
+
+  @ApiPropertyOptional({
+    type: [Number],
+    example: [1, 2],
+    description: 'Danh sách ID các danh mục được gán topping này',
+  })
+  @Transform(({ value }) => {
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed.map(Number) : [Number(value)];
+      } catch {
+        return value
+            .split(',')
+            .map((v) => Number(v.trim()))
+            .filter((n) => !isNaN(n));
+      }
+    }
+    if (Array.isArray(value)) {
+      return value.map(Number).filter((n) => !isNaN(n));
+    }
+    return value;
+  })
+  @IsArray({ message: 'categoryIds phải là một mảng ID' })
+  @IsOptional()
+  categoryIds?: number[];
+}
+
+
+==================== FILE: apps\api\src\toppings\dto\query-topping.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform, Type } from 'class-transformer';
+import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+
+export class QueryToppingDto {
+  @ApiPropertyOptional({ description: 'Tìm kiếm tên Topping' })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsOptional()
+  @IsString()
+  search?: string;
+
+  @ApiPropertyOptional({ description: 'Lọc topping theo ID danh mục' })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  categoryId?: number;
+
+  @ApiPropertyOptional({
+    type: Number,
+    default: 1,
+    description: 'Trang hiện tại',
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  page: number = 1;
+
+  @ApiPropertyOptional({
+    type: Number,
+    default: 50,
+    maximum: 100,
+    description: 'Số lượng mỗi trang',
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit: number = 50;
+}
+
+
+==================== FILE: apps\api\src\toppings\dto\update-topping.dto.ts ====================
+import { PartialType, OmitType } from '@nestjs/swagger';
+import { CreateToppingDto } from './create-topping.dto';
+
+export class UpdateToppingDto extends PartialType(
+    OmitType(CreateToppingDto, ['isAvailable'] as const),
+) {}
+
+
+==================== FILE: apps\api\src\toppings\entities\topping.entity.ts ====================
+export class Topping {}
+
+
+
+==================== FILE: apps\api\src\notifications\notifications.controller.ts ====================
+import {
+  BadRequestException,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseIntPipe,
+  Patch,
+  Query,
+} from '@nestjs/common';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { NotificationsService } from './notifications.service';
+import { QueryNotificationDto } from './dto/query-notification.dto';
+
+@ApiTags('notifications')
+@Controller('notifications')
+export class NotificationsController {
+  constructor(private readonly notificationsService: NotificationsService) {}
+
+  // ------------------------- ADMIN -------------------------
+
+  @Get()
+  @ApiOperation({ summary: 'Danh sách thông báo của Admin (phân trang, lọc đã đọc/loại)' })
+  findAll(@Query() query: QueryNotificationDto) {
+    return this.notificationsService.findAll(query);
+  }
+
+  @Get('unread-count')
+  @ApiOperation({ summary: 'Số thông báo chưa đọc của Admin' })
+  async unreadCount() {
+    return { count: await this.notificationsService.unreadCount() };
+  }
+
+  @Patch('read-all')
+  @ApiOperation({ summary: 'Đánh dấu tất cả thông báo Admin là đã đọc' })
+  markAllAsRead() {
+    return this.notificationsService.markAllAsRead();
+  }
+
+  @Delete('clear-read')
+  @ApiOperation({ summary: 'Xoá toàn bộ thông báo Admin đã đọc' })
+  clearRead() {
+    return this.notificationsService.clearRead();
+  }
+
+  // ------------------------- KHÁCH HÀNG -------------------------
+  // Khai báo TRƯỚC các route có :id để "me" không bị hiểu nhầm thành id
+
+  @Get('me')
+  @ApiOperation({ summary: 'Danh sách thông báo của khách hàng (?userId=)' })
+  findMine(@Query() query: QueryNotificationDto) {
+    if (!query.userId) throw new BadRequestException('userId là bắt buộc');
+    return this.notificationsService.findAll(query, query.userId);
+  }
+
+  @Get('me/unread-count')
+  @ApiOperation({ summary: 'Số thông báo chưa đọc của khách hàng' })
+  async myUnreadCount(@Query('userId', ParseIntPipe) userId: number) {
+    return { count: await this.notificationsService.unreadCount(userId) };
+  }
+
+  @Patch('me/read-all')
+  @ApiOperation({ summary: 'Khách hàng đánh dấu tất cả là đã đọc' })
+  markAllMineAsRead(@Query('userId', ParseIntPipe) userId: number) {
+    return this.notificationsService.markAllAsRead(userId);
+  }
+
+  @Patch('me/:id/read')
+  @ApiOperation({ summary: 'Khách hàng đánh dấu 1 thông báo là đã đọc' })
+  markMineAsRead(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('userId', ParseIntPipe) userId: number,
+  ) {
+    return this.notificationsService.markAsRead(id, userId);
+  }
+
+  // ------------------------- ADMIN (theo :id) -------------------------
+
+  @Patch(':id/read')
+  @ApiOperation({ summary: 'Đánh dấu 1 thông báo Admin là đã đọc' })
+  markAsRead(@Param('id', ParseIntPipe) id: number) {
+    return this.notificationsService.markAsRead(id);
+  }
+
+  @Delete(':id')
+  @ApiOperation({ summary: 'Xoá 1 thông báo Admin' })
+  remove(@Param('id', ParseIntPipe) id: number) {
+    return this.notificationsService.remove(id);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\notifications\notifications.module.ts ====================
+import { Global, Module } from '@nestjs/common';
+import { NotificationsService } from './notifications.service';
+import { NotificationsController } from './notifications.controller';
+
+// @Global: Orders / Payments / Products inject NotificationsService mà không cần import module riêng
+@Global()
+@Module({
+  controllers: [NotificationsController],
+  providers: [NotificationsService],
+  exports: [NotificationsService],
+})
+export class NotificationsModule {}
+
+
+
+==================== FILE: apps\api\src\notifications\notifications.service.ts ====================
+import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  NotificationAudience,
+  NotificationType,
+  OrderStatus,
+  Prisma,
+} from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { QueryNotificationDto } from './dto/query-notification.dto';
+
+/** Tồn kho <= ngưỡng này sẽ bắn cảnh báo "Sắp hết hàng" */
+export const LOW_STOCK_THRESHOLD = 10;
+
+/** Thông tin tối thiểu của đơn hàng để tạo thông báo */
+export interface OrderRef {
+  id: number;
+  userId: number;
+  finalAmount: number;
+  user?: { name: string | null; email: string } | null;
+}
+
+const money = (n: number) => `${n.toLocaleString('vi-VN')}đ`;
+
+@Injectable()
+export class NotificationsService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /** Dùng transaction client nếu được truyền vào để thông báo cùng commit/rollback với nghiệp vụ */
+  private db(tx?: Prisma.TransactionClient): Prisma.TransactionClient {
+    return tx ?? this.prisma;
+  }
+
+  /** userId có giá trị => thông báo của khách; ngược lại => thông báo của Admin */
+  private scope(userId?: number): Prisma.NotificationWhereInput {
+    return userId
+      ? { audience: NotificationAudience.CUSTOMER, userId }
+      : { audience: NotificationAudience.ADMIN };
+  }
+
+  // =========================================================================
+  // PHÁT SINH THÔNG BÁO (được gọi từ OrdersService / ProductsService...)
+  // =========================================================================
+
+  /** Có đơn mới => báo cho Admin */
+  async notifyOrderCreated(order: OrderRef, tx?: Prisma.TransactionClient) {
+    const who = order.user?.name || order.user?.email || `Khách #${order.userId}`;
+    await this.db(tx).notification.create({
+      data: {
+        audience: NotificationAudience.ADMIN,
+        type: NotificationType.ORDER_NEW,
+        title: `Đơn mới #${order.id}`,
+        message: `${who} · ${money(order.finalAmount)}`,
+        href: '/orders/all',
+        orderId: order.id,
+      },
+    });
+  }
+
+  /** Đổi trạng thái đơn => báo cho Admin (các mốc cần chú ý) và cho khách hàng */
+  async notifyOrderStatusChanged(
+    order: OrderRef,
+    next: OrderStatus,
+    tx?: Prisma.TransactionClient,
+  ) {
+    const who = order.user?.name || order.user?.email || `Khách #${order.userId}`;
+    const rows: Prisma.NotificationCreateManyInput[] = [];
+
+    // --- Admin: chỉ báo các mốc phát sinh từ phía khách / hệ thống thanh toán ---
+    if (next === OrderStatus.PAID) {
+      rows.push({
+        audience: NotificationAudience.ADMIN,
+        type: NotificationType.ORDER_UPDATE,
+        title: `Đơn #${order.id} đã thanh toán`,
+        message: `${who} · ${money(order.finalAmount)} · cần chuẩn bị`,
+        href: '/orders/all',
+        orderId: order.id,
+      });
+    } else if (next === OrderStatus.PAYMENT_FAILED) {
+      rows.push({
+        audience: NotificationAudience.ADMIN,
+        type: NotificationType.PAYMENT_FAILED,
+        title: `Thanh toán thất bại: đơn #${order.id}`,
+        message: `${who} · ${money(order.finalAmount)}`,
+        href: '/orders/all',
+        orderId: order.id,
+      });
+    } else if (next === OrderStatus.CANCELLED) {
+      rows.push({
+        audience: NotificationAudience.ADMIN,
+        type: NotificationType.ORDER_CANCELLED,
+        title: `Đơn #${order.id} đã bị huỷ`,
+        message: `${who} · ${money(order.finalAmount)}`,
+        href: '/orders/all',
+        orderId: order.id,
+      });
+    }
+
+    // --- Khách hàng: báo mọi mốc trạng thái ---
+    const customerCopy: Partial<
+      Record<OrderStatus, { type: NotificationType; title: string; message: string }>
+    > = {
+      [OrderStatus.PAID]: {
+        type: NotificationType.ORDER_UPDATE,
+        title: 'Thanh toán thành công',
+        message: 'Quán đã nhận đơn và sẽ sớm chuẩn bị đồ uống cho bạn.',
+      },
+      [OrderStatus.PAYMENT_FAILED]: {
+        type: NotificationType.PAYMENT_FAILED,
+        title: 'Thanh toán thất bại',
+        message: 'Vui lòng thử thanh toán lại hoặc chọn phương thức khác.',
+      },
+      [OrderStatus.PREPARING]: {
+        type: NotificationType.ORDER_UPDATE,
+        title: 'Đang pha chế',
+        message: 'Barista đang chuẩn bị đồ uống của bạn.',
+      },
+      [OrderStatus.READY]: {
+        type: NotificationType.ORDER_UPDATE,
+        title: 'Đồ uống đã sẵn sàng',
+        message: 'Mời bạn đến quầy nhận đồ uống.',
+      },
+      [OrderStatus.COMPLETED]: {
+        type: NotificationType.ORDER_UPDATE,
+        title: 'Đơn hàng hoàn tất',
+        message: 'Cảm ơn bạn đã ủng hộ BrewLite!',
+      },
+      [OrderStatus.CANCELLED]: {
+        type: NotificationType.ORDER_CANCELLED,
+        title: 'Đơn hàng đã bị huỷ',
+        message: 'Đơn hàng đã được huỷ, nếu đã thanh toán vui lòng liên hệ quán.',
+      },
+    };
+    const copy = customerCopy[next];
+    if (copy) {
+      rows.push({
+        audience: NotificationAudience.CUSTOMER,
+        userId: order.userId,
+        type: copy.type,
+        title: `Đơn #${order.id}: ${copy.title}`,
+        message: copy.message,
+        href: null,
+        orderId: order.id,
+      });
+    }
+
+    if (rows.length) {
+      await this.db(tx).notification.createMany({ data: rows });
+    }
+  }
+
+  /**
+   * Đồng bộ cảnh báo tồn kho của 1 sản phẩm (mỗi sản phẩm tối đa 1 cảnh báo, khoá bằng dedupeKey):
+   * - sản phẩm đã ẩn, hoặc stock > ngưỡng => xoá cảnh báo cũ (đã nhập thêm / hoàn kho do huỷ đơn / ngừng bán)
+   * - stock <= ngưỡng => tạo mới hoặc cập nhật số lượng; chuyển từ "sắp hết" sang "hết hàng" thì báo lại (chưa đọc)
+   */
+  async syncStockAlert(productId: number, tx?: Prisma.TransactionClient) {
+    const db = this.db(tx);
+    const product = await db.product.findUnique({
+      where: { id: productId },
+      select: { id: true, name: true, stock: true, isActive: true },
+    });
+    if (!product) return;
+
+    const dedupeKey = `STOCK:${product.id}`;
+
+    if (!product.isActive || product.stock > LOW_STOCK_THRESHOLD) {
+      await db.notification.deleteMany({ where: { dedupeKey } });
+      return;
+    }
+
+    const isOut = product.stock <= 0;
+    const content = {
+      type: isOut ? NotificationType.OUT_OF_STOCK : NotificationType.LOW_STOCK,
+      title: isOut ? `Hết hàng: ${product.name}` : `Sắp hết hàng: ${product.name}`,
+      message: isOut
+        ? 'Sản phẩm đã hết hàng, cần nhập thêm'
+        : `Chỉ còn ${product.stock} sản phẩm trong kho`,
+      href: '/products',
+      productId: product.id,
+    };
+
+    const existing = await db.notification.findUnique({ where: { dedupeKey } });
+    if (!existing) {
+      await db.notification.create({
+        data: { ...content, audience: NotificationAudience.ADMIN, dedupeKey },
+      });
+      return;
+    }
+
+    await db.notification.update({
+      where: { dedupeKey },
+      data: {
+        ...content,
+        ...(existing.type !== content.type
+          ? { isRead: false, readAt: null, createdAt: new Date() }
+          : {}),
+      },
+    });
+  }
+
+  async syncStockAlerts(productIds: number[], tx?: Prisma.TransactionClient) {
+    for (const id of new Set(productIds)) {
+      await this.syncStockAlert(id, tx);
+    }
+  }
+
+  // =========================================================================
+  // TRUY VẤN / THAO TÁC (Admin: không truyền userId — Khách: truyền userId)
+  // =========================================================================
+
+  async findAll(query: QueryNotificationDto = {}, userId?: number) {
+    const page = query.page || 1;
+    const limit = query.limit || 20;
+
+    const where: Prisma.NotificationWhereInput = {
+      ...this.scope(userId),
+      ...(query.isRead !== undefined ? { isRead: query.isRead } : {}),
+      ...(query.type ? { type: query.type } : {}),
+    };
+
+    const [data, total, unreadCount] = await Promise.all([
+      this.prisma.notification.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+      this.prisma.notification.count({ where }),
+      this.unreadCount(userId),
+    ]);
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+        unreadCount,
+      },
+    };
+  }
+
+  async unreadCount(userId?: number): Promise<number> {
+    return this.prisma.notification.count({
+      where: { ...this.scope(userId), isRead: false },
+    });
+  }
+
+  private async getOwned(id: number, userId?: number) {
+    const found = await this.prisma.notification.findFirst({
+      where: { id, ...this.scope(userId) },
+    });
+    if (!found) throw new NotFoundException(`Không tìm thấy thông báo #${id}`);
+    return found;
+  }
+
+  async markAsRead(id: number, userId?: number) {
+    const found = await this.getOwned(id, userId);
+    if (found.isRead) return found;
+    return this.prisma.notification.update({
+      where: { id },
+      data: { isRead: true, readAt: new Date() },
+    });
+  }
+
+  async markAllAsRead(userId?: number) {
+    const { count } = await this.prisma.notification.updateMany({
+      where: { ...this.scope(userId), isRead: false },
+      data: { isRead: true, readAt: new Date() },
+    });
+    return { success: true, updated: count };
+  }
+
+  async remove(id: number, userId?: number) {
+    await this.getOwned(id, userId);
+    await this.prisma.notification.delete({ where: { id } });
+    return { success: true };
+  }
+
+  async clearRead(userId?: number) {
+    const { count } = await this.prisma.notification.deleteMany({
+      where: { ...this.scope(userId), isRead: true },
+    });
+    return { success: true, deleted: count };
+  }
+}
+
+
+
+==================== FILE: apps\api\src\notifications\dto\query-notification.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  IsBoolean,
+  IsEnum,
+  IsInt,
+  IsOptional,
+  Max,
+  Min,
+} from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import { NotificationType } from '@prisma/client';
+
+export class QueryNotificationDto {
+  @ApiPropertyOptional({
+    type: Boolean,
+    description: 'true = đã đọc, false = chưa đọc, bỏ trống = tất cả',
+  })
+  @IsOptional()
+  // Đọc từ obj gốc để tránh việc "false" bị ép kiểu thành true khi bật enableImplicitConversion
+  @Transform(({ obj }) =>
+    obj.isRead === 'true' || obj.isRead === true
+      ? true
+      : obj.isRead === 'false' || obj.isRead === false
+        ? false
+        : undefined,
+  )
+  @IsBoolean()
+  isRead?: boolean;
+
+  @ApiPropertyOptional({
+    enum: NotificationType,
+    description: 'Lọc theo loại thông báo',
+  })
+  @IsOptional()
+  @IsEnum(NotificationType, { message: 'Loại thông báo không hợp lệ' })
+  type?: NotificationType;
+
+  @ApiPropertyOptional({
+    example: 1,
+    description: 'ID khách hàng (chỉ dùng cho các route /notifications/me)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  userId?: number;
+
+  @ApiPropertyOptional({ example: 1, default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @ApiPropertyOptional({ example: 20, default: 20 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number = 20;
+}
+
+
+
+==================== FILE: apps\api\src\dashboard\dashboard.controller.ts ====================
+import { Controller, Get, Query } from '@nestjs/common';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { DashboardService } from './dashboard.service';
+import { QueryDashboardDto } from './dto/query-dashboard.dto';
+
+@ApiTags('dashboard')
+@Controller('dashboard')
+export class DashboardController {
+  constructor(private readonly dashboardService: DashboardService) {}
+
+  @Get('summary')
+  @ApiOperation({
+    summary:
+      'Tổng quan trong ngày: doanh thu/đơn hôm nay so với hôm qua, hàng đợi cần xử lý, đơn gần đây, tồn kho, thông báo',
+  })
+  summary(@Query() query: QueryDashboardDto) {
+    return this.dashboardService.summary(query.recentOrders);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\dashboard\dashboard.module.ts ====================
+import { Module } from '@nestjs/common';
+import { DashboardController } from './dashboard.controller';
+import { DashboardService } from './dashboard.service';
+
+@Module({
+  controllers: [DashboardController],
+  providers: [DashboardService],
+})
+export class DashboardModule {}
+
+
+
+==================== FILE: apps\api\src\dashboard\dashboard.service.ts ====================
+import { Injectable } from '@nestjs/common';
+import { NotificationAudience, OrderStatus, Role } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { LOW_STOCK_THRESHOLD } from '../notifications/notifications.service';
+
+const DAY = 24 * 60 * 60 * 1000;
+const VN_OFFSET = 7 * 60 * 60 * 1000; // Gom nhóm theo ngày giờ Việt Nam (UTC+7)
+
+/** Đơn đã thanh toán thành công => tính vào doanh thu */
+const REVENUE_STATUSES: OrderStatus[] = [
+  OrderStatus.PAID,
+  OrderStatus.PREPARING,
+  OrderStatus.READY,
+  OrderStatus.COMPLETED,
+];
+
+/** Đơn cần nhân viên xử lý */
+const IN_PROGRESS: OrderStatus[] = [
+  OrderStatus.PAID,
+  OrderStatus.PREPARING,
+  OrderStatus.READY,
+];
+
+/**
+ * Nhóm trạng thái khớp các tab ở sidebar (All = tổng 4 nhóm).
+ * Đổi ở đây nếu lib/orderStatus của bạn nhóm khác.
+ */
+const STATUS_GROUPS = [
+  { key: 'received', name: 'Received', statuses: [OrderStatus.PENDING, OrderStatus.PAID] },
+  { key: 'processing', name: 'Processing', statuses: [OrderStatus.PREPARING, OrderStatus.READY] },
+  { key: 'completed', name: 'Completed', statuses: [OrderStatus.COMPLETED] },
+  { key: 'canceled', name: 'Canceled', statuses: [OrderStatus.CANCELLED, OrderStatus.PAYMENT_FAILED] },
+] as const;
+
+const pad = (n: number) => String(n).padStart(2, '0');
+
+/** % thay đổi so với kỳ trước; null = kỳ trước bằng 0 nhưng kỳ này có dữ liệu ("mới") */
+const change = (cur: number, prev: number): number | null =>
+  prev === 0 ? (cur > 0 ? null : 0) : Math.round(((cur - prev) / prev) * 100);
+
+const ORDER_ROW_SELECT = {
+  id: true,
+  status: true,
+  finalAmount: true,
+  createdAt: true,
+  user: { select: { name: true, email: true } },
+  orderItems: { select: { productName: true, qty: true } },
+} as const;
+
+type OrderRow = {
+  id: number;
+  status: OrderStatus;
+  finalAmount: number;
+  createdAt: Date;
+  user: { name: string | null; email: string } | null;
+  orderItems: { productName: string; qty: number }[];
+};
+
+@Injectable()
+export class DashboardService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  private mapOrder(o: OrderRow) {
+    const itemsCount = o.orderItems.reduce((s, i) => s + i.qty, 0);
+    const first = o.orderItems[0];
+    return {
+      id: o.id,
+      status: o.status,
+      total: o.finalAmount,
+      createdAt: o.createdAt,
+      customer: o.user?.name || o.user?.email || 'Khách',
+      itemsCount,
+      summary: first
+        ? `${first.productName}${o.orderItems.length > 1 ? ` +${o.orderItems.length - 1} món` : ''}`
+        : '',
+    };
+  }
+
+  async summary(recentLimit = 8) {
+    // ---------- Mốc thời gian (giờ Việt Nam) ----------
+    const nowShifted = new Date(Date.now() + VN_OFFSET);
+    const todayShifted = Date.UTC(
+      nowShifted.getUTCFullYear(),
+      nowShifted.getUTCMonth(),
+      nowShifted.getUTCDate(),
+    );
+    const todayStart = new Date(todayShifted - VN_OFFSET);
+    const weekStart = new Date(todayShifted - 6 * DAY - VN_OFFSET);
+
+    const dayKey = (shiftedMs: number) => {
+      const d = new Date(shiftedMs);
+      return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+    };
+
+    // 7 ngày gần nhất (cũ -> mới), ngày cuối là hôm nay
+    const days = Array.from({ length: 7 }, (_, i) => {
+      const ms = todayShifted - (6 - i) * DAY;
+      const d = new Date(ms);
+      return {
+        key: dayKey(ms),
+        label: `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}`,
+        revenue: 0,
+        orders: 0,
+        paidOrders: 0,
+      };
+    });
+    const dayMap = new Map(days.map((d) => [d.key, d]));
+
+    // ---------- Đơn 7 ngày: xu hướng + so sánh hôm nay/hôm qua ----------
+    const weekOrders = await this.prisma.order.findMany({
+      where: { createdAt: { gte: weekStart } },
+      select: { createdAt: true, status: true, finalAmount: true },
+    });
+    for (const o of weekOrders) {
+      const bucket = dayMap.get(dayKey(o.createdAt.getTime() + VN_OFFSET));
+      if (!bucket) continue;
+      bucket.orders += 1;
+      if (REVENUE_STATUSES.includes(o.status)) {
+        bucket.revenue += o.finalAmount;
+        bucket.paidOrders += 1;
+      }
+    }
+    const today = days[6];
+    const yesterday = days[5];
+
+    // ---------- Phân bố trạng thái (toàn bộ) ----------
+    const statusRows = await this.prisma.order.groupBy({
+      by: ['status'],
+      _count: { _all: true },
+    });
+    const count = (st: OrderStatus) =>
+      statusRows.find((r) => r.status === st)?._count._all ?? 0;
+
+    const statusDistribution = STATUS_GROUPS.map((g) => ({
+      key: g.key,
+      name: g.name,
+      value: g.statuses.reduce((s, st) => s + count(st), 0),
+    }));
+    const totalOrders = statusDistribution.reduce((s, g) => s + g.value, 0);
+
+    const pipeline = {
+      awaitingPayment: count(OrderStatus.PENDING),
+      paymentFailed: count(OrderStatus.PAYMENT_FAILED),
+      paid: count(OrderStatus.PAID),
+      preparing: count(OrderStatus.PREPARING),
+      ready: count(OrderStatus.READY),
+      inProgress: IN_PROGRESS.reduce((s, st) => s + count(st), 0),
+    };
+
+    // ---------- Hàng đợi cần xử lý + đơn gần đây ----------
+    const queueRows = await this.prisma.order.findMany({
+      where: { status: { in: IN_PROGRESS } },
+      orderBy: { createdAt: 'asc' },
+      take: 6,
+      select: ORDER_ROW_SELECT,
+    });
+    const recentRows = await this.prisma.order.findMany({
+      orderBy: { id: 'desc' },
+      take: recentLimit,
+      select: ORDER_ROW_SELECT,
+    });
+
+    // ---------- Top sản phẩm 7 ngày ----------
+    const itemRows = await this.prisma.orderItem.groupBy({
+      by: ['productId'],
+      where: { order: { status: { in: REVENUE_STATUSES }, createdAt: { gte: weekStart } } },
+      _sum: { lineTotal: true, qty: true },
+      orderBy: { _sum: { lineTotal: 'desc' } },
+      take: 5,
+    });
+    const names = await this.prisma.product.findMany({
+      where: { id: { in: itemRows.map((r) => r.productId) } },
+      select: { id: true, name: true },
+    });
+    const topProducts = itemRows.map((r) => ({
+      id: r.productId,
+      name: names.find((p) => p.id === r.productId)?.name ?? `#${r.productId}`,
+      revenue: r._sum.lineTotal ?? 0,
+      quantity: r._sum.qty ?? 0,
+    }));
+
+    // ---------- Tồn kho ----------
+    const [lowStock, outOfStock, lowStockProducts] = await Promise.all([
+      this.prisma.product.count({
+        where: { isActive: true, stock: { gt: 0, lte: LOW_STOCK_THRESHOLD } },
+      }),
+      this.prisma.product.count({ where: { isActive: true, stock: { lte: 0 } } }),
+      this.prisma.product.findMany({
+        where: { isActive: true, stock: { lte: LOW_STOCK_THRESHOLD } },
+        orderBy: [{ stock: 'asc' }, { id: 'asc' }],
+        take: 5,
+        select: { id: true, name: true, stock: true },
+      }),
+    ]);
+
+    // ---------- Khách hàng + thông báo ----------
+    const [totalCustomers, newCustomersToday, unread, latest] = await Promise.all([
+      this.prisma.user.count({ where: { role: Role.CUSTOMER } }),
+      this.prisma.user.count({
+        where: { role: Role.CUSTOMER, createdAt: { gte: todayStart } },
+      }),
+      this.prisma.notification.count({
+        where: { audience: NotificationAudience.ADMIN, isRead: false },
+      }),
+      this.prisma.notification.findMany({
+        where: { audience: NotificationAudience.ADMIN },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: 5,
+        select: {
+          id: true,
+          type: true,
+          title: true,
+          message: true,
+          href: true,
+          isRead: true,
+          createdAt: true,
+        },
+      }),
+    ]);
+
+    return {
+      generatedAt: new Date().toISOString(),
+      today: {
+        revenue: today.revenue,
+        orders: today.orders,
+        paidOrders: today.paidOrders,
+        avgOrderValue: today.paidOrders ? Math.round(today.revenue / today.paidOrders) : 0,
+        newCustomers: newCustomersToday,
+        revenueChange: change(today.revenue, yesterday.revenue),
+        ordersChange: change(today.orders, yesterday.orders),
+      },
+      week: {
+        revenue: days.reduce((s, d) => s + d.revenue, 0),
+        orders: days.reduce((s, d) => s + d.orders, 0),
+      },
+      trend: days.map(({ label, revenue, orders }) => ({ label, revenue, orders })),
+      totalOrders,
+      statusDistribution,
+      pipeline,
+      queue: queueRows.map((o) => this.mapOrder(o)),
+      recentOrders: recentRows.map((o) => this.mapOrder(o)),
+      topProducts,
+      stock: { lowStock, outOfStock, lowStockProducts },
+      customers: { total: totalCustomers, newToday: newCustomersToday },
+      notifications: { unread, latest },
+    };
+  }
+}
+
+
+
+==================== FILE: apps\api\src\dashboard\dto\query-dashboard.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsInt, IsOptional, Max, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+
+export class QueryDashboardDto {
+  @ApiPropertyOptional({
+    example: 8,
+    default: 8,
+    description: 'Số đơn hàng gần đây trả về (1-20)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt({ message: 'Số đơn gần đây phải là số nguyên' })
+  @Min(1)
+  @Max(20)
+  recentOrders?: number = 8;
+}
+
+
+
+==================== FILE: apps\api\src\reports\reports.controller.ts ====================
+import { Controller, Get, Query } from '@nestjs/common';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { ReportsService } from './reports.service';
+import { QueryReportDto } from './dto/query-report.dto';
+
+@ApiTags('reports')
+@Controller('reports')
+export class ReportsController {
+  constructor(private readonly reportsService: ReportsService) {}
+
+  @Get('summary')
+  @ApiOperation({
+    summary:
+      'Báo cáo tổng hợp: KPI, doanh thu theo thời gian, trạng thái đơn, top sản phẩm/khách, thanh toán, tồn kho',
+  })
+  summary(@Query() query: QueryReportDto) {
+    return this.reportsService.summary(query.range);
+  }
+}
+
+
+
+==================== FILE: apps\api\src\reports\reports.module.ts ====================
+import { Module } from '@nestjs/common';
+import { ReportsController } from './reports.controller';
+import { ReportsService } from './reports.service';
+
+@Module({
+  controllers: [ReportsController],
+  providers: [ReportsService],
+})
+export class ReportsModule {}
+
+
+
+==================== FILE: apps\api\src\reports\reports.service.ts ====================
+import { Injectable } from '@nestjs/common';
+import { OrderStatus, PaymentStatus, Role } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { LOW_STOCK_THRESHOLD } from '../notifications/notifications.service';
+import { REPORT_RANGES, ReportRange } from './dto/query-report.dto';
+
+type Granularity = 'day' | 'month';
+
+const DAY = 24 * 60 * 60 * 1000;
+const VN_OFFSET = 7 * 60 * 60 * 1000; // Gom nhóm theo ngày/tháng giờ Việt Nam (UTC+7), không phụ thuộc múi giờ máy chủ
+
+/** Đơn đã thanh toán thành công => tính vào doanh thu (đổi ở đây nếu muốn chỉ tính đơn COMPLETED) */
+const REVENUE_STATUSES: OrderStatus[] = [
+  OrderStatus.PAID,
+  OrderStatus.PREPARING,
+  OrderStatus.READY,
+  OrderStatus.COMPLETED,
+];
+
+/** Nhóm trạng thái hiển thị trên màn "Đơn hàng" (khớp tab Received/Processing/Completed/Canceled) */
+const STATUS_GROUPS = [
+  { key: 'received', name: 'Received', statuses: [OrderStatus.PAID] },
+  {
+    key: 'processing',
+    name: 'Processing',
+    statuses: [OrderStatus.PREPARING, OrderStatus.READY],
+  },
+  { key: 'completed', name: 'Completed', statuses: [OrderStatus.COMPLETED] },
+  { key: 'canceled', name: 'Canceled', statuses: [OrderStatus.CANCELLED] },
+] as const;
+
+const AWAITING_PAYMENT: OrderStatus[] = [
+  OrderStatus.PENDING,
+  OrderStatus.PAYMENT_FAILED,
+];
+
+const pad = (n: number) => String(n).padStart(2, '0');
+const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 100) : 0);
+
+@Injectable()
+export class ReportsService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  private parseRange(input?: string): ReportRange {
+    return (REPORT_RANGES as readonly string[]).includes(input ?? '')
+      ? (input as ReportRange)
+      : '6m';
+  }
+
+  /** `shifted` là Date đã cộng VN_OFFSET (đọc bằng getUTC*) */
+  private keyOf(shifted: Date, g: Granularity) {
+    const y = shifted.getUTCFullYear();
+    const m = pad(shifted.getUTCMonth() + 1);
+    return g === 'day' ? `${y}-${m}-${pad(shifted.getUTCDate())}` : `${y}-${m}`;
+  }
+
+  private async resolveRange(range: ReportRange) {
+    const nowShifted = new Date(Date.now() + VN_OFFSET);
+    const y = nowShifted.getUTCFullYear();
+    const m = nowShifted.getUTCMonth();
+    const todayStart = Date.UTC(y, m, nowShifted.getUTCDate());
+
+    let startShifted: number;
+    let granularity: Granularity;
+
+    if (range === '7d' || range === '30d') {
+      granularity = 'day';
+      startShifted = todayStart - ((range === '7d' ? 7 : 30) - 1) * DAY;
+    } else {
+      granularity = 'month';
+      if (range === '6m' || range === '12m') {
+        startShifted = Date.UTC(y, m - ((range === '6m' ? 6 : 12) - 1), 1);
+      } else {
+        const first = await this.prisma.order.findFirst({
+          orderBy: { createdAt: 'asc' },
+          select: { createdAt: true },
+        });
+        const f = new Date((first?.createdAt ?? new Date()).getTime() + VN_OFFSET);
+        startShifted = Date.UTC(f.getUTCFullYear(), f.getUTCMonth(), 1);
+      }
+    }
+
+    const buckets: { key: string; label: string }[] = [];
+    for (let t = startShifted; t <= nowShifted.getTime(); ) {
+      const d = new Date(t);
+      buckets.push({
+        key: this.keyOf(d, granularity),
+        label:
+          granularity === 'day'
+            ? `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}`
+            : `${pad(d.getUTCMonth() + 1)}/${d.getUTCFullYear()}`,
+      });
+      t =
+        granularity === 'day'
+          ? t + DAY
+          : Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+    }
+
+    return { start: new Date(startShifted - VN_OFFSET), granularity, buckets };
+  }
+
+  async summary(rangeInput?: string) {
+    const range = this.parseRange(rangeInput);
+    const { start, granularity, buckets } = await this.resolveRange(range);
+    const inRange = { createdAt: { gte: start } };
+
+    // ---------------- Đơn hàng: KPI, xu hướng, phân bố trạng thái ----------------
+    const orders = await this.prisma.order.findMany({
+      where: inRange,
+      select: {
+        createdAt: true,
+        status: true,
+        finalAmount: true,
+        discountAmount: true,
+      },
+    });
+
+    const trendMap = new Map(
+      buckets.map((b) => [b.key, { label: b.label, revenue: 0, orders: 0 }]),
+    );
+    const statusCount = new Map<OrderStatus, number>();
+    let revenue = 0;
+    let paidOrders = 0;
+    let discountTotal = 0;
+
+    for (const o of orders) {
+      statusCount.set(o.status, (statusCount.get(o.status) ?? 0) + 1);
+      if (!REVENUE_STATUSES.includes(o.status)) continue;
+
+      revenue += o.finalAmount;
+      paidOrders += 1;
+      discountTotal += o.discountAmount;
+
+      const bucket = trendMap.get(
+        this.keyOf(new Date(o.createdAt.getTime() + VN_OFFSET), granularity),
+      );
+      if (bucket) {
+        bucket.revenue += o.finalAmount;
+        bucket.orders += 1;
+      }
+    }
+
+    const statusDistribution = STATUS_GROUPS.map((g) => ({
+      key: g.key,
+      name: g.name,
+      value: g.statuses.reduce((s, st) => s + (statusCount.get(st) ?? 0), 0),
+    }));
+    const totalOrders = statusDistribution.reduce((s, g) => s + g.value, 0);
+    const completed =
+      statusDistribution.find((g) => g.key === 'completed')?.value ?? 0;
+    const canceled =
+      statusDistribution.find((g) => g.key === 'canceled')?.value ?? 0;
+    const awaitingPayment = AWAITING_PAYMENT.reduce(
+      (s, st) => s + (statusCount.get(st) ?? 0),
+      0,
+    );
+
+    // ---------------- Top sản phẩm theo doanh thu ----------------
+    const itemRows = await this.prisma.orderItem.groupBy({
+      by: ['productId'],
+      where: { order: { status: { in: REVENUE_STATUSES }, ...inRange } },
+      _sum: { lineTotal: true, qty: true },
+      orderBy: { _sum: { lineTotal: 'desc' } },
+      take: 5,
+    });
+    const productNames = await this.prisma.product.findMany({
+      where: { id: { in: itemRows.map((r) => r.productId) } },
+      select: { id: true, name: true },
+    });
+    const topProducts = itemRows.map((r) => ({
+      id: r.productId,
+      name: productNames.find((p) => p.id === r.productId)?.name ?? `#${r.productId}`,
+      revenue: r._sum.lineTotal ?? 0,
+      quantity: r._sum.qty ?? 0,
+    }));
+
+    // ---------------- Top khách hàng ----------------
+    const customerRows = await this.prisma.order.groupBy({
+      by: ['userId'],
+      where: { status: { in: REVENUE_STATUSES }, ...inRange },
+      _sum: { finalAmount: true },
+      _count: { _all: true },
+      orderBy: { _sum: { finalAmount: 'desc' } },
+      take: 5,
+    });
+    const customerUsers = await this.prisma.user.findMany({
+      where: { id: { in: customerRows.map((r) => r.userId) } },
+      select: { id: true, name: true, email: true },
+    });
+    const topCustomers = customerRows.map((r) => {
+      const u = customerUsers.find((x) => x.id === r.userId);
+      return {
+        id: r.userId,
+        name: u?.name || u?.email || `Khách #${r.userId}`,
+        orders: r._count._all,
+        spent: r._sum.finalAmount ?? 0,
+      };
+    });
+
+    // ---------------- Thanh toán ----------------
+    const paymentRows = await this.prisma.payment.groupBy({
+      by: ['status', 'method'],
+      where: inRange,
+      _count: { _all: true },
+      _sum: { amount: true },
+    });
+    let paySuccess = 0;
+    let payFailed = 0;
+    const byMethod = new Map<string, { method: string; count: number; amount: number }>();
+    for (const r of paymentRows) {
+      if (r.status === PaymentStatus.SUCCESS) {
+        paySuccess += r._count._all;
+        const cur = byMethod.get(r.method) ?? { method: r.method, count: 0, amount: 0 };
+        cur.count += r._count._all;
+        cur.amount += r._sum.amount ?? 0;
+        byMethod.set(r.method, cur);
+      } else {
+        payFailed += r._count._all;
+      }
+    }
+
+    // ---------------- Sản phẩm ----------------
+    const [totalProducts, activeProducts, lowStock, outOfStock, lowStockProducts] =
+      await Promise.all([
+        this.prisma.product.count(),
+        this.prisma.product.count({ where: { isActive: true } }),
+        this.prisma.product.count({
+          where: { isActive: true, stock: { gt: 0, lte: LOW_STOCK_THRESHOLD } },
+        }),
+        this.prisma.product.count({ where: { isActive: true, stock: { lte: 0 } } }),
+        this.prisma.product.findMany({
+          where: { isActive: true, stock: { lte: LOW_STOCK_THRESHOLD } },
+          orderBy: [{ stock: 'asc' }, { id: 'asc' }],
+          take: 5,
+          select: { id: true, name: true, stock: true },
+        }),
+      ]);
+
+    // ---------------- Người dùng ----------------
+    const roleRows = await this.prisma.user.groupBy({
+      by: ['role'],
+      _count: { _all: true },
+    });
+    const roleCount = (role: Role) =>
+      roleRows.find((r) => r.role === role)?._count._all ?? 0;
+    const newCustomers = await this.prisma.user.count({
+      where: { role: Role.CUSTOMER, ...inRange },
+    });
+    const loyalty = await this.prisma.user.aggregate({
+      _sum: { loyaltyPoints: true },
+    });
+
+    return {
+      range,
+      granularity,
+      generatedAt: new Date().toISOString(),
+      kpis: {
+        revenue,
+        totalOrders,
+        paidOrders,
+        awaitingPayment,
+        avgOrderValue: paidOrders > 0 ? Math.round(revenue / paidOrders) : 0,
+        completionRate: pct(completed, totalOrders),
+        cancelRate: pct(canceled, totalOrders),
+        discountTotal,
+      },
+      trend: [...trendMap.values()],
+      statusDistribution,
+      topProducts,
+      topCustomers,
+      payments: {
+        total: paySuccess + payFailed,
+        success: paySuccess,
+        failed: payFailed,
+        successRate: pct(paySuccess, paySuccess + payFailed),
+        byMethod: [...byMethod.values()],
+      },
+      products: {
+        total: totalProducts,
+        active: activeProducts,
+        inactive: totalProducts - activeProducts,
+        lowStock,
+        outOfStock,
+        lowStockProducts,
+      },
+      customers: {
+        total: roleCount(Role.ADMIN) + roleCount(Role.CUSTOMER),
+        admins: roleCount(Role.ADMIN),
+        customers: roleCount(Role.CUSTOMER),
+        newInRange: newCustomers,
+        loyaltyPoints: loyalty._sum.loyaltyPoints ?? 0,
+      },
+    };
+  }
+}
+
+
+
+==================== FILE: apps\api\src\reports\dto\query-report.dto.ts ====================
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsIn, IsOptional } from 'class-validator';
+
+export const REPORT_RANGES = ['7d', '30d', '6m', '12m', 'all'] as const;
+export type ReportRange = (typeof REPORT_RANGES)[number];
+
+export class QueryReportDto {
+  @ApiPropertyOptional({
+    enum: REPORT_RANGES,
+    default: '6m',
+    description:
+      'Khoảng thời gian: 7d, 30d (theo ngày) | 6m, 12m, all (theo tháng). Mặc định 6m',
+  })
+  @IsOptional()
+  @IsIn(REPORT_RANGES, {
+    message: `Khoảng thời gian không hợp lệ, chỉ nhận: ${REPORT_RANGES.join(', ')}`,
+  })
+  range?: ReportRange = '6m';
+}
+
+
+
+==================== FILE: tests\package-lock.json ====================
+{
+  "name": "brewlite-e2e-tests",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "brewlite-e2e-tests",
+      "devDependencies": {
+        "@playwright/test": "^1.51.0",
+        "@types/node": "^22.0.0"
+      }
+    },
+    "node_modules/@playwright/test": {
+      "version": "1.65.1",
+      "resolved": "https://registry.npmjs.org/@playwright/test/-/test-1.65.1.tgz",
+      "integrity": "sha512-y+NCIRm2LvY4slUVWvGh1nujJ8RF/hEisIsq2mtUPgdQC4L701bq5hZGMhrpeXjACvwvO9tj5dJqhvM6TP9lbw==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "dependencies": {
+        "playwright": "1.65.1"
+      },
+      "bin": {
+        "playwright": "cli.js"
+      },
+      "engines": {
+        "node": ">=20"
+      }
+    },
+    "node_modules/@types/node": {
+      "version": "22.20.5",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-22.20.5.tgz",
+      "integrity": "sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "undici-types": "~6.21.0"
+      }
+    },
+    "node_modules/playwright": {
+      "version": "1.65.1",
+      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.65.1.tgz",
+      "integrity": "sha512-vJ1FuoOrNwOKHUIVEvSt3jT1L+wjjDpwhwIstKtfvTh8XIG4FG4bIFuvNdMxi81LGfAhUgUZleVFaOLY4RIUUw==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "dependencies": {
+        "playwright-core": "1.65.1"
+      },
+      "bin": {
+        "playwright": "cli.js"
+      },
+      "engines": {
+        "node": ">=20"
+      }
+    },
+    "node_modules/playwright-core": {
+      "version": "1.65.1",
+      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.65.1.tgz",
+      "integrity": "sha512-hqPpz7blSMPxWVdoeE1yiBSzXsKiVOd2k+kjCvmUywD2GPO2Dd9HfcWnq9NN0GHbNZDFgZ9JfBFr+X5/BLo0qw==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "bin": {
+        "playwright-core": "cli.js"
+      },
+      "engines": {
+        "node": ">=20"
+      }
+    },
+    "node_modules/undici-types": {
+      "version": "6.21.0",
+      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
+      "integrity": "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==",
+      "dev": true,
+      "license": "MIT"
+    }
+  }
+}
+
+
+
+==================== FILE: tests\package.json ====================
+{
+  "name": "brewlite-e2e-tests",
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.51.0",
+    "@types/node": "^22.0.0"
+  }
+}
+
+
+==================== FILE: tests\playwright.config.ts ====================
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+    testDir: './e2e',
+    timeout: 45_000,
+    expect: { timeout: 10_000 },
+    fullyParallel: false,
+    retries: 0,
+    use: {
+        baseURL: process.env.E2E_BASE_URL || 'http://localhost:3000',
+        trace: 'on-first-retry',
+        screenshot: 'only-on-failure',
+    },
+    projects: [
+        {
+            name: 'Mobile Chrome (390x844)',
+            use: {
+                ...devices['iPhone 14'],
+                browserName: 'chromium',
+            },
+        },
+    ],
+});
+
+
+==================== FILE: tests\tsconfig.json ====================
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["**/*.ts"]
+}
+
+
+==================== FILE: tests\e2e\checkout.spec.ts ====================
+import { test, expect } from '@playwright/test';
+
+test('Luồng End-to-End Mobile: Xem menu -> Chọn món -> Đăng nhập -> Thanh toán -> Xác nhận đơn', async ({ page }) => {
+    const uniqueSuffix = `${Date.now()}`.slice(-8);
+    const uniqueEmail = `customer_${Date.now()}@brewlite.com`;
+    const uniquePhone = `09${uniqueSuffix}`;
+    const password = 'Password@123';
+
+    // 1. Mở trang thực đơn Mobile-First
+    await page.goto('/shop');
+    await expect(page.getByRole('heading', { name: 'Thực đơn' })).toBeVisible();
+
+    // 2. Bấm nút "+" của món đầu tiên còn hàng để mở CustomizeDialog
+    const firstAddBtn = page.locator('button[aria-label^="Chọn món "]:not([disabled])').first();
+    await expect(firstAddBtn).toBeVisible();
+    await firstAddBtn.click();
+
+    const addToCartBtn = page.getByRole('button', { name: /Thêm vào giỏ/i });
+    await expect(addToCartBtn).toBeVisible();
+    await addToCartBtn.click();
+
+    // 3. Mở thanh giỏ hàng nổi dưới đáy màn hình Mobile
+    const floatingCartLink = page.getByRole('link', { name: /Xem giỏ hàng/i });
+    await expect(floatingCartLink).toBeVisible();
+    await floatingCartLink.click();
+    await expect(page).toHaveURL(/\/shop\/cart/);
+
+    // 4. Bấm Thanh toán -> chuyển hướng sang trang Đăng nhập
+    await page.getByRole('button', { name: 'Thanh toán' }).click();
+    await expect(page).toHaveURL(/\/auth\/login/);
+
+    // 5. Chuyển sang tab Đăng Ký và tạo tài khoản mới
+    await page.getByRole('button', { name: 'Đăng Ký', exact: true }).click();
+    await page.locator('#name').fill('Nguyễn Văn Kiểm Thử');
+    await page.locator('#phone').fill(uniquePhone);
+    await page.locator('#email').fill(uniqueEmail);
+    await page.locator('#password').fill(password);
+    await page.getByRole('button', { name: 'Đăng Ký Thành Viên' }).click();
+
+    // Hệ thống tự chuyển về tab Đăng Nhập và xóa ô mật khẩu -> nhập lại để đăng nhập
+    const loginSubmitBtn = page.locator('form button[type="submit"]');
+    await expect(loginSubmitBtn).toHaveText(/Đăng Nhập/);
+    await page.locator('#email').fill(uniqueEmail);
+    await page.locator('#password').fill(password);
+    await loginSubmitBtn.click();
+
+    // 6. Quay lại trang Checkout, chọn Thẻ ngân hàng và thanh toán
+    await expect(page).toHaveURL(/\/shop\/checkout/);
+    await page.getByRole('button', { name: /Thẻ ngân hàng/i }).click();
+
+    const payCardBtn = page.locator('button:visible').filter({ hasText: /Thanh toán thẻ/i });
+    await expect(payCardBtn).toBeVisible();
+    await payCardBtn.click();
+
+    // 7. Xác nhận màn hình đặt hàng thành công & theo dõi tiến trình đơn
+    await expect(page).toHaveURL(/\/shop\/checkout\/success/);
+    await expect(page.getByRole('heading', { name: 'Đặt hàng thành công!' })).toBeVisible();
+    await expect(page.getByText('Đã thanh toán')).toBeVisible();
+
+    await page.getByRole('link', { name: /Theo dõi tiến trình đơn/i }).click();
+    await expect(page).toHaveURL(/\/shop\/orders/);
+    await expect(page.getByText('Đã thanh toán').first()).toBeVisible();
+});
+
+
+==================== FILE: tests\test-results\.last-run.json ====================
+{
+  "status": "passed",
+  "failedTests": []
+}
+
+
