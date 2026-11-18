@@ -14,6 +14,7 @@ import {
     CheckCircle2,
     AlertTriangle,
     Loader2,
+    Ban,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -45,9 +46,10 @@ export default function OrderHistoryPage() {
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    // State phục vụ modal thanh toán lại
+    // State phục vụ modal thanh toán lại & hủy đơn
     const [repayOrder, setRepayOrder] = useState<any | null>(null);
     const [paying, setPaying] = useState(false);
+    const [cancellingOrderId, setCancellingOrderId] = useState<number | string | null>(null);
 
     const loadOrders = useCallback(async (isSilent = false) => {
         if (!isSilent) {
@@ -138,6 +140,26 @@ export default function OrderHistoryPage() {
             await loadOrders(false);
         } finally {
             setPaying(false);
+        }
+    };
+
+    // Xử lý hủy đơn hàng
+    const handleCancelOrder = async (orderId: number | string) => {
+        if (cancellingOrderId !== null) return;
+        setCancellingOrderId(orderId);
+        try {
+            await apiFetch(`/orders/${orderId}/cancel`, {
+                method: "PATCH",
+            });
+            toast.success("Đã hủy đơn hàng. Tồn kho và voucher đã được hoàn lại.");
+            if (repayOrder?.id === orderId) {
+                setRepayOrder(null);
+            }
+            await loadOrders(false);
+        } catch (err: any) {
+            toast.error(err?.message || "Không thể hủy đơn hàng này");
+        } finally {
+            setCancellingOrderId(null);
         }
     };
 
@@ -319,7 +341,7 @@ export default function OrderHistoryPage() {
                                     </div>
                                 )}
 
-                                {/* KHUNG THANH TOÁN THẤT BẠI + NÚT THANH TOÁN LẠI */}
+                                {/* KHUNG THANH TOÁN THẤT BẠI + NÚT THANH TOÁN LẠI / HỦY ĐƠN */}
                                 {isFailed && (
                                     <div className="my-3 p-3 sm:p-4 rounded-xl bg-[#FBE9E7] border border-[#F3C9C3] flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2.5">
                                         <div className="flex items-start sm:items-center gap-2 text-[#A12B1F] text-xs font-semibold">
@@ -328,14 +350,33 @@ export default function OrderHistoryPage() {
                                                 Giao dịch chưa thành công. Bạn có thể thanh toán lại để giữ đơn!
                                             </span>
                                         </div>
-                                        <Button
-                                            size="sm"
-                                            onClick={() => setRepayOrder(order)}
-                                            className="rounded-xl bg-[#B45F2B] hover:bg-[#9A4F22] text-white text-xs font-bold shrink-0 shadow-xs flex items-center justify-center gap-1.5 h-10 w-full sm:w-auto"
-                                        >
-                                            <RotateCcw className="w-3.5 h-3.5" />
-                                            Thanh toán lại
-                                        </Button>
+                                        <div className="flex items-center gap-2 shrink-0">
+                                            <Button
+                                                type="button"
+                                                size="sm"
+                                                variant="outline"
+                                                disabled={cancellingOrderId === order.id}
+                                                onClick={() => handleCancelOrder(order.id)}
+                                                className="rounded-xl border-[#F3C9C3] bg-white hover:bg-[#FBE9E7] text-[#A12B1F] text-xs font-bold h-10 px-3 flex-1 sm:flex-initial flex items-center justify-center gap-1.5"
+                                            >
+                                                {cancellingOrderId === order.id ? (
+                                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                                ) : (
+                                                    <Ban className="w-3.5 h-3.5" />
+                                                )}
+                                                <span>Hủy đơn</span>
+                                            </Button>
+                                            <Button
+                                                type="button"
+                                                size="sm"
+                                                disabled={cancellingOrderId === order.id}
+                                                onClick={() => setRepayOrder(order)}
+                                                className="rounded-xl bg-[#B45F2B] hover:bg-[#9A4F22] text-white text-xs font-bold shadow-xs flex items-center justify-center gap-1.5 h-10 px-4 flex-1 sm:flex-initial"
+                                            >
+                                                <RotateCcw className="w-3.5 h-3.5" />
+                                                <span>Thanh toán lại</span>
+                                            </Button>
+                                        </div>
                                     </div>
                                 )}
 
@@ -450,8 +491,9 @@ export default function OrderHistoryPage() {
                             <button
                                 type="button"
                                 onClick={() => setRepayOrder(null)}
+                                disabled={paying || cancellingOrderId === repayOrder.id}
                                 aria-label="Đóng"
-                                className="text-[#6B5E52] hover:text-[#2B2118] p-2 rounded-full hover:bg-[#FAF7F2]"
+                                className="text-[#6B5E52] hover:text-[#2B2118] p-2 rounded-full hover:bg-[#FAF7F2] disabled:opacity-50"
                             >
                                 <X className="w-5 h-5" />
                             </button>
@@ -478,8 +520,9 @@ export default function OrderHistoryPage() {
 
                         <div className="space-y-2 pt-2 border-t border-[#E8E2D9]">
                             <Button
+                                type="button"
                                 onClick={() => handleExecuteRepay(false)}
-                                disabled={paying}
+                                disabled={paying || cancellingOrderId === repayOrder.id}
                                 className="w-full bg-[#1E6B34] hover:bg-[#165227] text-white rounded-xl h-11 text-sm font-bold flex items-center justify-center gap-1.5 shadow-sm shadow-[#1E6B34]/20 active:scale-[0.98] transition-transform"
                             >
                                 {paying ? (
@@ -498,11 +541,31 @@ export default function OrderHistoryPage() {
                             <Button
                                 type="button"
                                 onClick={() => handleExecuteRepay(true)}
-                                disabled={paying}
+                                disabled={paying || cancellingOrderId === repayOrder.id}
                                 className="w-full bg-red-600 hover:bg-red-700 text-white rounded-xl h-10 text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm shadow-red-600/20 active:scale-[0.98] transition-transform"
                             >
                                 <AlertTriangle className="w-4 h-4" />
                                 <span>Giả lập tiếp tục thất bại (Demo)</span>
+                            </Button>
+
+                            <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => handleCancelOrder(repayOrder.id)}
+                                disabled={paying || cancellingOrderId === repayOrder.id}
+                                className="w-full border-[#F3C9C3] bg-[#FAF7F2] hover:bg-[#FBE9E7] text-[#A12B1F] rounded-xl h-10 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors"
+                            >
+                                {cancellingOrderId === repayOrder.id ? (
+                                    <>
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        <span>Đang hủy đơn...</span>
+                                    </>
+                                ) : (
+                                    <>
+                                        <Ban className="w-3.5 h-3.5" />
+                                        <span>Hủy đơn hàng này</span>
+                                    </>
+                                )}
                             </Button>
                         </div>
                     </div>
