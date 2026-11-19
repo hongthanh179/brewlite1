@@ -6,12 +6,30 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
-import { PrismaService } from './prisma/prisma.service'; // Kiểm tra đúng đường dẫn PrismaService của bạn
+import { PrismaService } from './prisma/prisma.service';
 
 @ApiTags('Health (Kiểm tra hệ thống)')
 @Controller()
 export class AppController {
   constructor(private readonly prisma: PrismaService) {}
+
+  @Get()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Thông tin gốc của BrewLite REST API' })
+  @ApiResponse({ status: 200, description: 'API đang hoạt động bình thường (200 OK)' })
+  getApiRoot() {
+    return {
+      status: 'ok',
+      service: 'BrewLite Cashless Ordering API',
+      version: '1.0.0',
+      timestamp: new Date().toISOString(),
+      endpoints: {
+        health: '/api/health',
+        docs: '/api/docs',
+        products: '/api/products',
+      },
+    };
+  }
 
   @Get('health')
   @HttpCode(HttpStatus.OK)
