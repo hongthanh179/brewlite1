@@ -1,0 +1,460 @@
+﻿
+==================== FILE: .github\workflows\main.yml ====================
+name: CI/CD Production Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop", "feat/**" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_API: ${{ github.repository }}/brewlite-api
+  IMAGE_WEB: ${{ github.repository }}/brewlite-web
+
+jobs:
+  # =========================================================
+  # BƯỚC 1: QUALITY GATE (LINT, TEST & BUILD)
+  # =========================================================
+  quality-gate:
+    name: 1. Lint, Test and Build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: brewlite
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d brewlite"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/brewlite?schema=public
+      JWT_SECRET: brewlite_ci_secret_key_2026
+      NEXT_PUBLIC_API_URL: http://localhost:3001/api
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install, Migrate, Seed, Unit Test & Build API
+        working-directory: apps/api
+        run: |
+          npm ci
+          npx prisma generate
+          npx prisma migrate deploy
+          npx tsx prisma/seed.ts
+          npm run lint --if-present
+          npm test
+          npm run build
+
+      - name: Install, Lint & Build Web
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run lint --if-present
+          npm run build
+
+      - name: Start Servers & Run API Integration + Mobile E2E Tests
+        run: |
+          npm --prefix tests ci
+          npx --prefix tests playwright install --with-deps chromium
+          API_ENTRY=$(find apps/api/dist -name "main.js" | head -n 1)
+          echo "Starting API from: $API_ENTRY"
+          node "$API_ENTRY" &
+          npm --prefix apps/web run start &
+          timeout 60 bash -c 'until curl -sf http://localhost:3001/api/health && curl -sf http://localhost:3000; do sleep 2; done'
+          npm --prefix apps/api run test:e2e -- orders-checkout.e2e-spec.ts
+          npm --prefix tests run test:e2e
+
+  # =========================================================
+  # BƯỚC 2 & 3: BUILD DOCKER IMAGE (TAG SHA) & PUSH REGISTRY
+  # =========================================================
+  docker-build-push:
+    name: 2. Docker Image & Push Registry
+    needs: quality-gate
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set Image Tag (Commit SHA or Git Tag)
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "sha_tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "full_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & Push API Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/api
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_API }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_API }}:${{ steps.meta.outputs.full_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_API }}:latest
+
+      - name: Build & Push Web Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/web
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.PROD_API_URL }}/api
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_WEB }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_WEB }}:${{ steps.meta.outputs.full_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_WEB }}:latest
+
+  # =========================================================
+  # BƯỚC 4 & 5: DEPLOY PRODUCTION (CI SECRETS + SAFE MIGRATION)
+  # =========================================================
+  deploy-production:
+    name: 3. Deploy to Render Production
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    outputs:
+      prev_api_deploy: ${{ steps.snapshot.outputs.prev_api_deploy }}
+      prev_web_deploy: ${{ steps.snapshot.outputs.prev_web_deploy }}
+
+    steps:
+      - name: Save Previous Live Deploy IDs (for Rollback)
+        id: snapshot
+        run: |
+          PREV_API=$(curl -sf -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_API_SERVICE_ID }}/deploys?limit=1" | jq -r '.[0].deploy.id // empty')
+          PREV_WEB=$(curl -sf -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_WEB_SERVICE_ID }}/deploys?limit=1" | jq -r '.[0].deploy.id // empty')
+          echo "prev_api_deploy=$PREV_API" >> $GITHUB_OUTPUT
+          echo "prev_web_deploy=$PREV_WEB" >> $GITHUB_OUTPUT
+          echo "Saved rollback targets -> API: $PREV_API | WEB: $PREV_WEB"
+
+      - name: Trigger Render API & Web Deployments
+        run: |
+          curl -sf -X POST "${{ secrets.RENDER_API_DEPLOY_HOOK }}"
+          echo ""
+          curl -sf -X POST "${{ secrets.RENDER_WEB_DEPLOY_HOOK }}"
+          echo ""
+
+      - name: Wait for Render Deployments to Become Live
+        run: |
+          echo "Waiting 90s for Render build, safe prisma migrate deploy, and startup..."
+          sleep 90
+
+  # =========================================================
+  # BƯỚC 6 & 7: SMOKE TEST & AUTO-ROLLBACK ON FAILURE
+  # =========================================================
+  smoke-test:
+    name: 4. Smoke Test & Rollback Guard
+    needs: deploy-production
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run Production Smoke Tests (Health, Products API, Web UI)
+        id: verify
+        run: |
+          set -e
+          echo "1. Checking API Health Endpoint..."
+          for i in {1..10}; do
+            if curl -sf "${{ secrets.PROD_API_URL }}/api/health"; then
+              echo " -> API Health OK!"
+              break
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "ERROR: API Health Check failed after 10 attempts!"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          echo "2. Checking Products Endpoint..."
+          curl -sf "${{ secrets.PROD_API_URL }}/api/products?limit=2" | grep -q '"statusCode":200'
+
+          echo "3. Checking Frontend Web Availability..."
+          curl -sf -I "${{ secrets.PROD_WEB_URL }}/shop" | grep -q "200"
+
+          echo ">>> ALL PRODUCTION SMOKE TESTS PASSED! <<<"
+
+      - name: Rollback Production on Failure & Halt Pipeline
+        if: failure()
+        run: |
+          echo "CRITICAL: Smoke test failed! Initiating automatic rollback on Render..."
+          PREV_API="${{ needs.deploy-production.outputs.prev_api_deploy }}"
+          PREV_WEB="${{ needs.deploy-production.outputs.prev_web_deploy }}"
+
+          if [ -n "$PREV_API" ]; then
+            curl -sf -X POST -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"deployId\": \"$PREV_API\"}" \
+              "https://api.render.com/v1/services/${{ secrets.RENDER_API_SERVICE_ID }}/rollback" || true
+          fi
+
+          if [ -n "$PREV_WEB" ]; then
+            curl -sf -X POST -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"deployId\": \"$PREV_WEB\"}" \
+              "https://api.render.com/v1/services/${{ secrets.RENDER_WEB_SERVICE_ID }}/rollback" || true
+          fi
+
+          echo "Rollback triggered. Pipeline halted with failure status."
+          exit 1
+
+
+==================== FILE: docker-compose.yml ====================
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: brewlite
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d brewlite"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - brewlite-net
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - '3001:3001'
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/brewlite?schema=public
+      JWT_SECRET: brewlite_jwt_secret_key_2026
+    volumes:
+      - ./apps/api/uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3001/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - brewlite-net
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:3001/api
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: http://localhost:3001/api
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - brewlite-net
+
+volumes:
+  postgres_data:
+
+networks:
+  brewlite-net:
+    driver: bridge
+
+
+==================== FILE: apps\api\package.json ====================
+{
+  "name": "backend",
+  "version": "0.0.1",
+  "description": "",
+  "author": "",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "nest build",
+    "deploy": "nest deploy",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:debug": "nest start --debug --watch",
+    "start:prod": "node dist/src/main",
+    "lint": "oxlint src/ test/",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:cov": "jest --coverage",
+    "test:robustness": "jest orders-state-machine payments-idempotency orders-concurrency --verbose",
+    "db:migrate": "prisma migrate dev --name init_db",
+    "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
+    "test:e2e": "jest --config ./test/jest-e2e.json"
+  },
+  "dependencies": {
+    "@nestjs/common": "^12.0.1",
+    "@nestjs/core": "^12.0.1",
+    "@nestjs/jwt": "^12.0.2",
+    "@nestjs/mapped-types": "*",
+    "@nestjs/passport": "^12.0.0",
+    "@nestjs/platform-express": "^12.0.1",
+    "@nestjs/schedule": "^12.0.2",
+    "@nestjs/serve-static": "^12.0.0",
+    "@nestjs/swagger": "^12.0.1",
+    "bcrypt": "^6.0.0",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "passport": "^0.7.0",
+    "passport-jwt": "^4.0.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^12.0.0",
+    "@nestjs/mau": "^0.2.6",
+    "@nestjs/schematics": "^12.0.0",
+    "@nestjs/testing": "^12.0.1",
+    "@prisma/client": "5.22.0",
+    "@types/bcrypt": "^6.0.0",
+    "@types/express": "^5.0.0",
+    "@types/jest": "^30.0.0",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^24.0.0",
+    "@types/passport-jwt": "^4.0.1",
+    "@types/supertest": "^7.0.0",
+    "jest": "^30.0.0",
+    "oxlint": "^1.58.0",
+    "prettier": "^3.4.2",
+    "prisma": "5.22.0",
+    "source-map-support": "^0.5.21",
+    "supertest": "^7.0.0",
+    "ts-jest": "^29.2.5",
+    "ts-loader": "^9.5.2",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.2"
+  },
+  "prisma": {
+    "seed": "npx tsx prisma/seed.ts"
+  }
+}
+
+
+==================== FILE: apps\web\package.json ====================
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wait-on tcp:3001 && next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.4.0",
+    "@mui/material": "^9.4.0",
+    "@popperjs/core": "^2.11.8",
+    "@radix-ui/react-accordion": "^1.2.21",
+    "@radix-ui/react-alert-dialog": "^1.1.24",
+    "@radix-ui/react-aspect-ratio": "^1.1.16",
+    "@radix-ui/react-avatar": "^1.2.7",
+    "@radix-ui/react-checkbox": "^1.3.12",
+    "@radix-ui/react-collapsible": "^1.1.21",
+    "@radix-ui/react-context-menu": "^2.3.8",
+    "@radix-ui/react-dialog": "^1.2.0",
+    "@radix-ui/react-dropdown-menu": "^2.1.25",
+    "@radix-ui/react-hover-card": "^1.1.24",
+    "@radix-ui/react-label": "^2.1.16",
+    "@radix-ui/react-menubar": "^1.1.25",
+    "@radix-ui/react-navigation-menu": "^1.3.0",
+    "@radix-ui/react-popover": "^1.2.0",
+    "@radix-ui/react-progress": "^1.1.17",
+    "@radix-ui/react-radio-group": "^1.4.8",
+    "@radix-ui/react-scroll-area": "^1.3.0",
+    "@radix-ui/react-select": "^2.3.8",
+    "@radix-ui/react-separator": "^1.1.16",
+    "@radix-ui/react-slider": "^1.5.0",
+    "@radix-ui/react-slot": "^1.4.0",
+    "@radix-ui/react-switch": "^1.3.8",
+    "@radix-ui/react-tabs": "^1.1.22",
+    "@radix-ui/react-toggle": "^1.1.19",
+    "@radix-ui/react-toggle-group": "^1.1.20",
+    "@radix-ui/react-tooltip": "^1.3.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "date-fns": "^4.4.0",
+    "embla-carousel-react": "^8.6.0",
+    "input-otp": "^1.5.0",
+    "lucide-react": "^1.52.0",
+    "motion": "^14.0.0",
+    "next": "16.3.5",
+    "next-themes": "^0.4.6",
+    "react": "19.2.8",
+    "react-day-picker": "^10.0.2",
+    "react-dnd": "^16.0.1",
+    "react-dnd-html5-backend": "^16.0.1",
+    "react-dom": "19.2.8",
+    "react-hook-form": "^7.89.0",
+    "react-popper": "^2.3.0",
+    "react-resizable-panels": "^4.14.2",
+    "react-responsive-masonry": "^2.9.0",
+    "react-slick": "^0.31.0",
+    "recharts": "^3.10.1",
+    "sonner": "^2.0.8",
+    "tailwind-merge": "^3.7.0",
+    "tw-animate-css": "^1.4.0",
+    "vaul": "^1.1.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.5",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
+
+
+
