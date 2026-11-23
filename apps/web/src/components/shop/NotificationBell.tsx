@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { useRouter, usePathname } from "next/navigation";
-import { Bell, CheckCheck, Loader2, X, BellRing } from "lucide-react";
+import { Bell, CheckCheck, Loader2, X, BellRing, ShoppingBag } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
 import { apiFetch } from "@/lib/api";
@@ -18,19 +19,48 @@ interface NotificationItem {
     data?: { orderId?: number };
 }
 
+function formatRelativeTime(dateStr: string): string {
+    const date = new Date(dateStr);
+    const diffSec = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (diffSec < 60) return "Vừa xong";
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin} phút trước`;
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return `${diffHour} giờ trước`;
+    return date.toLocaleTimeString("vi-VN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        day: "2-digit",
+        month: "2-digit",
+    });
+}
+
 export default function NotificationBell() {
     const { user, isAuthenticated } = useAuth();
     const router = useRouter();
     const pathname = usePathname();
 
+    const [mounted, setMounted] = useState(false);
     const [unreadCount, setUnreadCount] = useState(0);
     const [notifications, setNotifications] = useState<NotificationItem[]>([]);
     const [open, setOpen] = useState(false);
+    const [filter, setFilter] = useState<"all" | "unread">("all");
     const [loading, setLoading] = useState(false);
-    const dropdownRef = useRef<HTMLDivElement>(null);
+
+    // State hỗ trợ vuốt xuống để đóng Bottom Sheet trên mobile
+    const [dragOffset, setDragOffset] = useState(0);
+    const touchStartY = useRef<number | null>(null);
+
+    const triggerRef = useRef<HTMLDivElement>(null);
+    const sheetRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        setMounted(true);
+    }, []);
 
     const loadData = useCallback(async () => {
         if (!isAuthenticated || !user?.id) return;
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
 
         try {
             const [countRes, listRes] = await Promise.all([
@@ -48,57 +78,92 @@ export default function NotificationBell() {
 
             setNotifications(items);
         } catch {
-            // Bỏ qua lỗi ngầm khi mạng chập chờn
+            // Bỏ qua lỗi mạng ngầm
         }
     }, [isAuthenticated, user?.id]);
 
     useEffect(() => {
         loadData();
         const interval = setInterval(loadData, 10000);
-        return () => clearInterval(interval);
+        const handleVisibility = () => {
+            if (document.visibilityState === "visible") loadData();
+        };
+        document.addEventListener("visibilitychange", handleVisibility);
+        return () => {
+            clearInterval(interval);
+            document.removeEventListener("visibilitychange", handleVisibility);
+        };
     }, [loadData]);
 
-    // Đóng dropdown khi click ra ngoài (chỉ áp dụng cho màn hình desktop)
+    // Đóng popup khi click ra ngoài (tương thích cả Portal trên Desktop) hoặc nhấn ESC
     useEffect(() => {
+        if (!open) return;
+
         const handleClickOutside = (e: MouseEvent) => {
-            if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+            const target = e.target as Node;
+            if (
+                triggerRef.current &&
+                !triggerRef.current.contains(target) &&
+                sheetRef.current &&
+                !sheetRef.current.contains(target)
+            ) {
                 setOpen(false);
             }
         };
-        document.addEventListener("mousedown", handleClickOutside);
-        return () => document.removeEventListener("mousedown", handleClickOutside);
-    }, []);
 
-    // Khóa cuộn trang nền khi mở thông báo trên màn hình điện thoại (PWA UX)
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === "Escape") setOpen(false);
+        };
+
+        document.addEventListener("mousedown", handleClickOutside);
+        document.addEventListener("keydown", handleKeyDown);
+        return () => {
+            document.removeEventListener("mousedown", handleClickOutside);
+            document.removeEventListener("keydown", handleKeyDown);
+        };
+    }, [open]);
+
+    // Khóa cuộn nền khi mở Bottom Sheet trên Mobile PWA
     useEffect(() => {
         if (open) {
             document.body.classList.add("overflow-hidden", "sm:overflow-auto");
         } else {
             document.body.classList.remove("overflow-hidden", "sm:overflow-auto");
+            setDragOffset(0);
         }
         return () => document.body.classList.remove("overflow-hidden", "sm:overflow-auto");
     }, [open]);
 
     const markAsRead = async (id: number) => {
         if (!user?.id) return;
+        // Optimistic update: phản hồi tức thì trên giao diện mobile
+        setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, isRead: true } : n)));
+        setUnreadCount((c) => Math.max(0, c - 1));
+
         try {
             await apiFetch(`/notifications/me/${id}/read?userId=${user.id}`, { method: "PATCH" });
-            setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, isRead: true } : n)));
-            setUnreadCount((c) => Math.max(0, c - 1));
         } catch (err: any) {
+            loadData(); // Đồng bộ lại nếu lỗi mạng
             toast.error(err.message || "Không thể cập nhật trạng thái");
         }
     };
 
     const markAllRead = async () => {
-        if (!user?.id) return;
+        if (!user?.id || loading) return;
         setLoading(true);
+        const prevList = notifications;
+        const prevCount = unreadCount;
+
+        // Optimistic update
+        setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
+        setUnreadCount(0);
+
         try {
             await apiFetch(`/notifications/me/read-all?userId=${user.id}`, { method: "PATCH" });
-            setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
-            setUnreadCount(0);
-            toast.success("Đã đánh dấu đã đọc tất cả");
+            toast.success("Đã đánh dấu đọc tất cả");
         } catch (err: any) {
+            setNotifications(prevList);
+            setUnreadCount(prevCount);
             toast.error(err.message || "Lỗi thao tác");
         } finally {
             setLoading(false);
@@ -138,121 +203,219 @@ export default function NotificationBell() {
         }
     };
 
+    // Xử lý vuốt xuống trên thanh kéo (Drag Handle / Header)
+    const handleTouchStart = (e: React.TouchEvent) => {
+        touchStartY.current = e.touches[0].clientY;
+    };
+
+    const handleTouchMove = (e: React.TouchEvent) => {
+        if (touchStartY.current === null) return;
+        const deltaY = e.touches[0].clientY - touchStartY.current;
+        if (deltaY > 0) {
+            setDragOffset(deltaY);
+        }
+    };
+
+    const handleTouchEnd = () => {
+        if (dragOffset > 90) {
+            setOpen(false);
+        }
+        setDragOffset(0);
+        touchStartY.current = null;
+    };
+
     if (!isAuthenticated) return null;
 
+    const displayedNotifications =
+        filter === "unread" ? notifications.filter((n) => !n.isRead) : notifications;
+
+    const sheetContent = (
+        <div className="fixed inset-0 z-50 flex flex-col justify-end sm:block sm:pointer-events-none">
+            {/* Backdrop mờ nền trên Mobile */}
+            <div
+                className="fixed inset-0 bg-black/50 backdrop-blur-xs sm:hidden animate-in fade-in duration-200"
+                onClick={() => setOpen(false)}
+            />
+
+            {/* Container chính: Bottom Sheet trên Mobile, Floating Panel góc phải trên Desktop */}
+            <div
+                ref={sheetRef}
+                style={{
+                    transform: dragOffset > 0 ? `translateY(${dragOffset}px)` : undefined,
+                }}
+                className="relative z-10 w-full max-h-[85dvh] rounded-t-3xl bg-[#FFFFFF] border-t sm:border border-[#E8E2D9] shadow-2xl flex flex-col overflow-hidden pointer-events-auto transition-transform duration-150 ease-out sm:fixed sm:top-16 sm:right-6 sm:w-96 sm:max-h-[32rem] sm:rounded-2xl animate-in slide-in-from-bottom sm:slide-in-from-top-2 duration-200"
+            >
+                {/* Vùng kéo (Swipe Handle + Header) */}
+                <div
+                    onTouchStart={handleTouchStart}
+                    onTouchMove={handleTouchMove}
+                    onTouchEnd={handleTouchEnd}
+                    className="bg-[#FAF7F2] border-b border-[#E8E2D9] shrink-0 select-none"
+                >
+                    {/* Thanh quai kéo trên Mobile */}
+                    <div className="pt-2.5 pb-1 flex justify-center sm:hidden">
+                        <div className="w-10 h-1.5 bg-[#D5CBC0] rounded-full" />
+                    </div>
+
+                    {/* Hàng tiêu đề & Nút đóng chuẩn chạm 44px */}
+                    <div className="flex items-center justify-between px-4 py-2.5 sm:py-3.5">
+                        <div className="flex items-center gap-2">
+                            <div className="w-8 h-8 rounded-full bg-[#B45F2B]/12 flex items-center justify-center text-[#B45F2B]">
+                                <BellRing className="w-4 h-4" />
+                            </div>
+                            <div>
+                                <div className="flex items-center gap-1.5">
+                                    <h3 className="font-bold text-sm text-[#2B2118]">Thông báo</h3>
+                                    {unreadCount > 0 && (
+                                        <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#B45F2B] text-white">
+                                            {unreadCount}
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-1">
+                            {unreadCount > 0 && (
+                                <button
+                                    type="button"
+                                    onClick={markAllRead}
+                                    disabled={loading}
+                                    className="min-h-10 px-2.5 rounded-xl text-xs font-semibold text-[#B45F2B] hover:bg-[#B45F2B]/10 active:bg-[#B45F2B]/15 flex items-center gap-1.5 disabled:opacity-50 transition-colors"
+                                >
+                                    {loading ? (
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                    ) : (
+                                        <CheckCheck className="w-4 h-4" />
+                                    )}
+                                    <span>Đọc hết</span>
+                                </button>
+                            )}
+
+                            <button
+                                type="button"
+                                onClick={() => setOpen(false)}
+                                aria-label="Đóng thông báo"
+                                className="min-w-11 min-h-11 flex items-center justify-center rounded-xl text-[#6B5E52] hover:bg-[#E8E2D9]/50 active:bg-[#E8E2D9] sm:hidden"
+                            >
+                                <X className="w-5 h-5" />
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Tab lọc nhanh Tất cả / Chưa đọc */}
+                    <div className="flex items-center gap-2 px-4 pb-2.5">
+                        <button
+                            type="button"
+                            onClick={() => setFilter("all")}
+                            className={`min-h-8 px-3 rounded-full text-xs font-semibold transition-colors ${
+                                filter === "all"
+                                    ? "bg-[#2B2118] text-white"
+                                    : "bg-white text-[#6B5E52] border border-[#E8E2D9]"
+                            }`}
+                        >
+                            Tất cả ({notifications.length})
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setFilter("unread")}
+                            className={`min-h-8 px-3 rounded-full text-xs font-semibold transition-colors ${
+                                filter === "unread"
+                                    ? "bg-[#B45F2B] text-white"
+                                    : "bg-white text-[#6B5E52] border border-[#E8E2D9]"
+                            }`}
+                        >
+                            Chưa đọc ({unreadCount})
+                        </button>
+                    </div>
+                </div>
+
+                {/* Danh sách thông báo có đệm safe-area-inset-bottom */}
+                <div className="overflow-y-auto divide-y divide-[#E8E2D9] overscroll-contain pb-[max(1rem,env(safe-area-inset-bottom))]">
+                    {displayedNotifications.length === 0 ? (
+                        <div className="py-12 px-6 text-center space-y-1.5">
+                            <div className="w-12 h-12 rounded-full bg-[#FAF7F2] mx-auto flex items-center justify-center mb-2">
+                                <Bell className="w-6 h-6 text-[#6B5E52]/40" />
+                            </div>
+                            <p className="font-semibold text-sm text-[#2B2118]">
+                                {filter === "unread" ? "Không có thông báo chưa đọc" : "Chưa có thông báo nào"}
+                            </p>
+                            <p className="text-xs text-[#6B5E52]">
+                                Cập nhật trạng thái pha chế và đơn hàng của bạn sẽ xuất hiện tại đây
+                            </p>
+                        </div>
+                    ) : (
+                        displayedNotifications.map((item) => (
+                            <button
+                                key={item.id}
+                                type="button"
+                                onClick={() => handleItemClick(item)}
+                                className={`w-full p-4 flex items-start gap-3 text-left transition-colors active:bg-[#FDF1E7] ${
+                                    item.isRead ? "bg-[#FFFFFF]" : "bg-[#FDF1E7]/55 hover:bg-[#FDF1E7]/80"
+                                }`}
+                            >
+                                <div
+                                    className={`w-9 h-9 rounded-xl shrink-0 flex items-center justify-center mt-0.5 ${
+                                        item.isRead
+                                            ? "bg-[#FAF7F2] text-[#6B5E52]"
+                                            : "bg-[#B45F2B]/15 text-[#B45F2B]"
+                                    }`}
+                                >
+                                    <ShoppingBag className="w-4 h-4" />
+                                </div>
+
+                                <div className="flex-1 min-w-0">
+                                    <div className="flex items-start justify-between gap-2">
+                                        <p
+                                            className={`text-[13px] leading-snug ${
+                                                item.isRead
+                                                    ? "font-medium text-[#2B2118]/85"
+                                                    : "font-bold text-[#2B2118]"
+                                            }`}
+                                        >
+                                            {item.title}
+                                        </p>
+                                        {!item.isRead && (
+                                            <span className="w-2.5 h-2.5 rounded-full bg-[#B45F2B] shrink-0 mt-1 ring-2 ring-[#FDF1E7]" />
+                                        )}
+                                    </div>
+
+                                    <p className="text-xs text-[#6B5E52] mt-1 leading-relaxed line-clamp-2">
+                                        {item.message}
+                                    </p>
+
+                                    <span className="text-[11px] font-medium text-[#6B5E52]/80 mt-1.5 block">
+                                        {formatRelativeTime(item.createdAt)}
+                                    </span>
+                                </div>
+                            </button>
+                        ))
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+
     return (
-        <div className="relative" ref={dropdownRef}>
-            {/* Nút Chuông thông báo */}
+        <div className="relative" ref={triggerRef}>
+            {/* Nút Chuông chuẩn touch target >= 44x44px (min-w-11 min-h-11) */}
             <Button
                 variant="ghost"
                 size="icon"
-                className="relative rounded-xl text-[#2B2118] hover:bg-[#FAF7F2] hover:text-[#2B2118] transition-colors w-9 h-9 sm:w-10 sm:h-10"
+                className="relative rounded-xl text-[#2B2118] hover:bg-[#FAF7F2] active:scale-95 transition-all min-w-11 min-h-11"
                 aria-label="Thông báo đơn hàng"
-                onClick={() => setOpen(!open)}
+                aria-expanded={open}
+                onClick={() => setOpen((prev) => !prev)}
             >
                 <Bell className="w-5 h-5" />
                 {unreadCount > 0 && (
-                    <span className="absolute -top-0.5 -right-0.5 bg-[#A12B1F] text-white text-[10px] sm:text-[11px] font-bold h-4.5 min-w-[18px] px-1 rounded-full flex items-center justify-center ring-2 ring-[#FFFFFF] animate-pulse">
+                    <span className="absolute top-1 right-1 bg-[#A12B1F] text-white text-[10px] font-bold h-[18px] min-w-[18px] px-1 rounded-full flex items-center justify-center ring-2 ring-[#FFFFFF]">
                         {unreadCount > 99 ? "99+" : unreadCount}
                     </span>
                 )}
             </Button>
 
-            {/* GIAO DIỆN THÔNG BÁO:
-                - Mobile: Bottom Sheet trượt từ đáy màn hình lên, full-width (360px–410px), có Backdrop làm mờ, không bao giờ bị cắt xén cạnh trái/phải.
-                - Desktop (sm trở lên): Dropdown menu neo góc phải như cũ.
-            */}
-            {open && (
-                <>
-                    {/* Backdrop mờ nền khi mở trên mobile */}
-                    <div
-                        className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs sm:hidden animate-in fade-in duration-200"
-                        onClick={() => setOpen(false)}
-                    />
-
-                    <div className="fixed inset-x-0 bottom-0 z-50 max-h-[85vh] rounded-t-2xl sm:rounded-2xl sm:absolute sm:inset-x-auto sm:right-0 sm:bottom-auto sm:top-full sm:mt-2 sm:w-96 bg-[#FFFFFF] border border-[#E8E2D9] shadow-2xl overflow-hidden flex flex-col animate-in slide-in-from-bottom sm:slide-in-from-bottom-0 sm:zoom-in-95 duration-200">
-                        {/* Thanh quai kéo (drag handle) chỉ hiển thị trên mobile */}
-                        <div className="w-12 h-1.5 bg-[#E8E2D9] rounded-full mx-auto mt-2.5 sm:hidden shrink-0" />
-
-                        {/* Tiêu đề & Nút thao tác */}
-                        <div className="flex items-center justify-between p-3.5 sm:p-4 border-b border-[#E8E2D9] bg-[#FAF7F2] shrink-0">
-                            <div className="flex items-center gap-2">
-                                <BellRing className="w-4 h-4 text-[#B45F2B]" />
-                                <span className="font-bold text-sm text-[#2B2118]">Thông báo của bạn</span>
-                                {unreadCount > 0 && (
-                                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[#B45F2B]/10 text-[#B45F2B]">
-                                        {unreadCount} mới
-                                    </span>
-                                )}
-                            </div>
-
-                            <div className="flex items-center gap-2">
-                                {unreadCount > 0 && (
-                                    <button
-                                        type="button"
-                                        onClick={markAllRead}
-                                        disabled={loading}
-                                        className="text-xs text-[#B45F2B] hover:text-[#9A4F22] hover:underline flex items-center gap-1 font-semibold disabled:opacity-50 transition-colors py-1 px-2 rounded-lg"
-                                    >
-                                        {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCheck className="w-3.5 h-3.5" />}
-                                        <span className="hidden xs:inline">Đọc tất cả</span>
-                                        <span className="xs:hidden">Đã đọc hết</span>
-                                    </button>
-                                )}
-                                {/* Nút X đóng popup trên Mobile */}
-                                <button
-                                    type="button"
-                                    onClick={() => setOpen(false)}
-                                    className="p-1 rounded-lg text-[#6B5E52] hover:bg-[#E8E2D9]/40 sm:hidden"
-                                >
-                                    <X className="w-5 h-5" />
-                                </button>
-                            </div>
-                        </div>
-
-                        {/* Danh sách thông báo */}
-                        <div className="overflow-y-auto divide-y divide-[#E8E2D9] max-h-[60vh] sm:max-h-80 overscroll-contain">
-                            {notifications.length === 0 ? (
-                                <div className="py-12 px-4 text-center text-xs text-[#6B5E52] space-y-1">
-                                    <Bell className="w-8 h-8 mx-auto text-[#6B5E52]/30 mb-2" />
-                                    <p className="font-semibold text-[#2B2118]">Bạn chưa có thông báo nào</p>
-                                    <p className="text-[11px]">Các cập nhật về đơn hàng sẽ hiển thị ở đây</p>
-                                </div>
-                            ) : (
-                                notifications.map((item) => (
-                                    <div
-                                        key={item.id}
-                                        onClick={() => handleItemClick(item)}
-                                        className={`p-3.5 transition-colors cursor-pointer text-left active:bg-[#FDF1E7] ${
-                                            item.isRead ? "bg-[#FFFFFF] opacity-80" : "bg-[#FDF1E7]/40 hover:bg-[#FDF1E7]"
-                                        }`}
-                                    >
-                                        <div className="flex justify-between items-start gap-2">
-                                            <p className={`text-xs ${item.isRead ? "font-medium text-[#2B2118]" : "font-bold text-[#2B2118]"}`}>
-                                                {item.title}
-                                            </p>
-                                            {!item.isRead && (
-                                                <span className="w-2 h-2 rounded-full bg-[#B45F2B] shrink-0 mt-1 ring-2 ring-[#FDF1E7]" />
-                                            )}
-                                        </div>
-                                        <p className="text-xs text-[#6B5E52] mt-1 leading-relaxed">
-                                            {item.message}
-                                        </p>
-                                        <span className="text-[10px] text-[#6B5E52]/80 mt-1.5 block">
-                                            {new Date(item.createdAt).toLocaleTimeString("vi-VN", {
-                                                hour: "2-digit",
-                                                minute: "2-digit",
-                                                day: "2-digit",
-                                                month: "2-digit",
-                                            })}
-                                        </span>
-                                    </div>
-                                ))
-                            )}
-                        </div>
-                    </div>
-                </>
-            )}
+            {open && mounted && createPortal(sheetContent, document.body)}
         </div>
     );
 }
