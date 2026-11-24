@@ -329,65 +329,57 @@ Luồng bình thường: Chờ thanh toán → Đã thanh toán → Đang pha ch
 ![Sơ đồ Use Case](../diagrams/usecase-diagram.png)
 
 ```plantuml
-@startuml usecase-overview
+@startuml
 left to right direction
 skinparam packageStyle rectangle
 skinparam shadowing false
-skinparam actorStyle awesome
-skinparam padding 12
-skinparam dpi 150
+skinparam defaultFontName Arial
 
 actor "Khách hàng" as Customer
-actor "Quản trị viên\n(Admin)" as Admin
+actor "Quản trị viên" as Admin
 actor "Payment Service" as PaymentService <<system>>
 
 rectangle "BrewLite" {
-  ' --- Phân hệ Khách hàng ---
-  usecase "Xem menu & Danh mục" as UC_Menu
-  usecase "Xem chi tiết & Tuỳ chọn\n(Size, Topping)" as UC_Detail
-  usecase "Quản lý giỏ hàng" as UC_Cart
-  usecase "Đặt đơn hàng" as UC_Order
-  usecase "Áp dụng mã giảm giá" as UC_Coupon
-  usecase "Thanh toán đơn hàng" as UC_Pay
-  usecase "Thử lại thanh toán" as UC_RetryPay
-  usecase "Xem lịch sử & Theo dõi đơn" as UC_History
-  usecase "Đăng ký / Đăng nhập" as UC_Customer_Auth
+  ' Cụm chức năng của Khách hàng
+  usecase "Xem menu & danh\nmục (UC-01)" as UC01
+  usecase "Xem chi tiết & Tùy chọn\n(Size, Topping) (UC-02)" as UC02
+  usecase "Quản lí\ngiỏ hàng (UC-03)" as UC03
+  usecase "Đăng kí / Đăng\nnhập (UC-04)" as UC04
+  usecase "Đặt đơn hàng\n(UC-05)" as UC05
+  usecase "Thanh toán đơn\nhàng (UC-07)" as UC07
+  usecase "Xem lịch sử &\ntheo dõi đơn (UC-09)" as UC09
 
-  ' --- Phân hệ Quản trị viên ---
-  usecase "Đăng nhập" as UC_Admin_Login
-  usecase "Quản lý thực đơn & Giảm giá" as UC_Admin_Menu
-  usecase "Tiếp nhận & Cập nhật trạng thái đơn" as UC_Admin_Order
-  usecase "Xem thông báo hệ thống" as UC_Admin_Noti
+  ' Cụm xác thực chung & Quản trị viên
+  usecase "Đăng\nnhập (UC-10)" as Login
+  usecase "Quản lý thực đơn & Giảm\ngiá (UC-12)" as UC12
+  usecase "Tiếp nhận &\nCập nhật trạng thái đơn\n(UC-11)" as UC11
+  usecase "Xem\nthông báo hệ thống\n(UC-13)" as UC13
 }
 
-' ================= LIÊN KẾT KHÁCH HÀNG =================
-Customer --> UC_Menu
-Customer --> UC_Detail
-Customer --> UC_Cart
-Customer --> UC_Order
-Customer --> UC_History
-Customer --> UC_Customer_Auth
+' Liên kết Actor - Use case (Khách hàng)
+Customer -- UC01
+Customer -- UC02
+Customer -- UC03
+Customer -- UC04
+Customer -- UC05
+Customer -- UC07
+Customer -- UC09
 
-' Ràng buộc luồng Khách hàng
-UC_Order ..> UC_Pay : <<include>>
-UC_Order ..> UC_Customer_Auth : <<include>>
-UC_History ..> UC_Customer_Auth : <<include>>
+' Liên kết Actor - Use case (Quản trị viên & Payment Service)
+Admin -- Login
+Admin -- UC12
+Admin -- UC11
+Admin -- UC13
+PaymentService -- UC07
 
-UC_Coupon .> UC_Order : <<extend>>
-UC_RetryPay .> UC_Pay : <<extend>>
+' Quan hệ <<include>>
+UC05 ..> UC04 : <<include>>
+UC09 ..> UC04 : <<include>>
 
-' Liên kết bên ngoài
-UC_Pay -- PaymentService
+UC12 ..> Login : <<include>>
+UC11 ..> Login : <<include>>
+UC13 ..> Login : <<include>>
 
-' ================= LIÊN KẾT QUẢN TRỊ VIÊN =================
-Admin --> UC_Admin_Login
-Admin --> UC_Admin_Menu
-Admin --> UC_Admin_Order
-Admin --> UC_Admin_Noti
-
-' Ràng buộc luồng Quản trị viên
-UC_Admin_Menu ..> UC_Admin_Login : <<include>>
-UC_Admin_Order ..> UC_Admin_Login : <<include>>
 @enduml
 ```
 

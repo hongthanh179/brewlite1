@@ -1,0 +1,29 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+actor "Khách hàng" as Customer
+actor "Payment Service" as PaymentService <<system>>
+
+rectangle "Phân hệ Đặt & Thanh toán - BrewLite" {
+  usecase "Đặt đơn hàng\n(UC-05)" as UC05
+  usecase "Áp dụng mã giảm\ngiá (UC-06)" as UC06
+
+  usecase "Thanh toán đơn\nhàng (UC-07)" as UC07
+  usecase "Chọn\nphương thức thanh toán\n(UC-07.1)" as UC07_1
+  usecase "Tích điểm\n(UC-07.2)" as UC07_2
+  usecase "Thử lại thanh toán\n(UC-08)" as UC08
+}
+
+Customer -- UC05
+Customer -- UC07
+PaymentService -- UC07
+
+UC06 ..> UC05 : <<extend>>
+UC07 ..> UC07_1 : <<include>>
+UC07_2 ..> UC07 : <<extend>>
+UC08 ..> UC07 : <<extend>>
+
+@enduml
