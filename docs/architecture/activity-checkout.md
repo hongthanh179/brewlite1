@@ -14,7 +14,7 @@ Sơ đồ mô tả luồng hoạt động end-to-end từ lúc khách hàng bấ
 Sơ đồ thể hiện đủ các yêu cầu của Task 2.1:
 
 - có điểm bắt đầu và các điểm kết thúc (thanh toán thành công, đơn giữ `PAYMENT_FAILED`, đơn bị hủy);
-- phân làn theo ba tác nhân: **Customer**, **System**, **Payment Gateway**;
+- phân làn theo bốn tác nhân: **Customer**, **System**, **Payment Service**, **Admin**;
 - có các nút quyết định (rẽ nhánh **Có** hoặc **Không**) và vòng lặp cho nhánh thành công và thất bại;
 - có đủ ba tình huống bắt buộc: **chưa đăng nhập**, **hết hàng**, **thanh toán thất bại**.
 
@@ -48,9 +48,10 @@ skinparam DefaultTextAlignment center
 
 title Activity Diagram - Luồng Đặt hàng & Thanh toán (BrewLite Checkout Flow)
 
-|#EBF5FB|Customer|
-|#FEF9E7|System|
-|#EAFAF1|Payment Gateway|
+|Customer|
+|System|
+|Payment Service|
+|Admin|
 
 |Customer|
 start
@@ -62,25 +63,23 @@ start
 |System|
 :Kiểm tra trạng thái đăng nhập;
 
-' SỬA LẠI ĐIỀU KIỆN ĐĂNG NHẬP ĐỂ HIỂN THỊ RÕ CÓ/KHÔNG
 if (Đã đăng nhập?) then (Có)
   ' Đã đăng nhập thì đi tiếp
 else (Không)
   |Customer|
-  :Đăng nhập;
+  :Đăng nhập/Đăng kí;
   |System|
 endif
 
 repeat
   |System|
   :Kiểm tra giỏ hàng & tồn kho;
-  
+
   |Customer|
 backward: Hiển thị "Món đã hết hoặc không đủ số lượng"
 <size:10><i>Đơn không được tạo, không trừ tồn kho
 Khách cập nhật lại Giỏ hàng;
   |System|
-' SỬA NHÃN VÒNG LẶP TỒN KHO THÀNH KHÔNG / CÓ
 repeat while (Đủ tồn kho?) is (Không) not (Có)
 
 :Tạo đơn hàng (PENDING)
@@ -99,9 +98,9 @@ repeat
   :Gửi yêu cầu thanh toán kèm Key;
 
   |System|
-  :Chuyển yêu cầu sang cổng thanh toán;
+  :Chuyển yêu cầu sang Payment Service;
 
-  |Payment Gateway|
+  |Payment Service|
   :Xử lý giao dịch;
 
   |System|
@@ -114,6 +113,13 @@ repeat
     |Customer|
     :Hiển thị màn hình Đặt hàng thành công;
     :Chuyển sang Theo dõi đơn hàng;
+
+    |Admin|
+    :Nhận thông báo & cập nhật trạng thái đơn
+    <size:10><i>Đang pha chế -> Sẵn sàng;
+
+    |Customer|
+    :Nhận đơn hàng & hoàn tất;
     stop
   else (Không)
     |System|
@@ -123,14 +129,13 @@ repeat
     |Customer|
     :Hiển thị "Thanh toán thất bại";
   endif
-' NHÃN VÒNG LẶP THỬ LẠI ĐÃ CHUẨN CÓ / KHÔNG
 repeat while (Khách hàng bấm "Thử lại"?) is (Có) not (Không)
 
 ' ===== KHÔNG THỬ LẠI =====
 |Customer|
-:Đơn hàng giữ trạng thái PAYMENT_FAILED;
-:Khách có thể thanh toán lại từ "Đơn của tôi";
-stop
+:Đơn hàng giữ trạng thái PAYMENT_FAILED
+<size:10><i>Khách vẫn có thể thanh toán lại từ "Đơn của tôi"
+<size:10><i>cho đến khi hết thời hạn;
 
 ' ===== NHÁNH HỦY ĐƠN (Xử lý ngầm định) =====
 |System|
@@ -151,9 +156,10 @@ stop
 
 | Làn | Vai trò trong luồng | Hoạt động chính |
 |---|---|---|
-| **Customer** (khách hàng, giao diện web/PWA) | Khởi tạo và hoàn tất các thao tác của người dùng | Mở giỏ, nhập mã giảm giá, bấm "Thanh toán", đăng nhập, cập nhật giỏ, chọn Ví/Thẻ, sinh `Idempotency-Key`, gửi yêu cầu thanh toán, xem kết quả, bấm "Thử lại" |
-| **System** (BrewLite) | Kiểm tra nghiệp vụ, ghi nhận dữ liệu, điều phối thanh toán | Kiểm tra đăng nhập, giỏ hàng và tồn kho, tạo đơn, trừ tồn kho, chuyển yêu cầu sang cổng thanh toán, cập nhật trạng thái đơn, tích điểm, làm trống giỏ, thông báo cho quản trị viên, hủy đơn (quá hạn thanh toán hoặc Admin hủy) và hoàn trả |
-| **Payment Gateway** (cổng thanh toán mô phỏng) | Xử lý giao dịch Ví/Thẻ | Nhận yêu cầu, xử lý và trả kết quả thành công hoặc thất bại |
+| **Customer** (khách hàng, giao diện web/PWA) | Khởi tạo và hoàn tất các thao tác của người dùng | Mở giỏ, nhập mã giảm giá, bấm "Thanh toán", đăng nhập, cập nhật giỏ, chọn Ví/Thẻ, sinh `Idempotency-Key`, gửi yêu cầu thanh toán, xem kết quả, bấm "Thử lại", nhận đơn hàng |
+| **System** (BrewLite) | Kiểm tra nghiệp vụ, ghi nhận dữ liệu, điều phối thanh toán | Kiểm tra đăng nhập, giỏ hàng và tồn kho, tạo đơn, trừ tồn kho, chuyển yêu cầu sang Payment Service, cập nhật trạng thái đơn, tích điểm, làm trống giỏ, thông báo cho quản trị viên, hủy đơn (quá hạn thanh toán hoặc Admin hủy) và hoàn trả |
+| **Payment Service** (dịch vụ thanh toán mô phỏng) | Xử lý giao dịch Ví/Thẻ | Nhận yêu cầu, xử lý và trả kết quả thành công hoặc thất bại |
+| **Admin** (quản trị viên) | Tiếp nhận và xử lý đơn đã thanh toán | Nhận thông báo, cập nhật trạng thái đơn (Đang pha chế → Sẵn sàng) |
 
 ---
 
@@ -180,13 +186,14 @@ stop
 ### 4.4. Vòng lặp thanh toán
 
 8. Ứng dụng phía khách sinh một `Idempotency-Key` và gửi yêu cầu thanh toán kèm khóa này. Khi khách bấm "Thử lại", một khóa **mới** được sinh. Khi cùng một lần thanh toán bị gửi lặp (bấm đúp, mạng chậm), khóa giữ nguyên nên hệ thống nhận ra và chỉ tính tiền một lần.
-9. Hệ thống chuyển yêu cầu sang cổng thanh toán; cổng xử lý giao dịch và trả kết quả.
+9. Hệ thống chuyển yêu cầu sang Payment Service; Payment Service xử lý giao dịch và trả kết quả.
 10. **Giao dịch thành công (Có):**
     - đơn chuyển `PAID`;
     - cộng điểm tích lũy theo quy tắc 10.000đ = 1 điểm;
     - làm trống giỏ hàng;
     - gửi thông báo cho quản trị viên;
-    - khách thấy màn hình "Đặt hàng thành công" và được chuyển sang theo dõi đơn hàng. **Kết thúc luồng.**
+    - khách thấy màn hình "Đặt hàng thành công" và được chuyển sang theo dõi đơn hàng;
+    - Admin nhận thông báo và cập nhật trạng thái đơn (Đang pha chế → Sẵn sàng); khách nhận đơn hàng và hoàn tất. **Kết thúc luồng.**
 11. **Giao dịch thất bại (Không):**
     - đơn chuyển `PAYMENT_FAILED`;
     - gửi thông báo cho quản trị viên;
@@ -195,7 +202,7 @@ stop
 
 ### 4.5. Khách không thử lại và nhánh hủy đơn
 
-13. **Khách không bấm "Thử lại" (Không):** hệ thống không hủy đơn ngay. Đơn giữ trạng thái `PAYMENT_FAILED`; khách có thể thanh toán lại từ "Đơn của tôi". **Kết thúc nhánh này.**
+13. **Khách không bấm "Thử lại" (Không):** hệ thống không hủy đơn ngay. Đơn giữ trạng thái `PAYMENT_FAILED`; khách vẫn có thể thanh toán lại từ "Đơn của tôi" cho đến khi hết thời hạn thanh toán.
 14. **Nhánh hủy đơn (xử lý ngầm định):** đơn chưa thanh toán bị hủy khi quá thời hạn thanh toán hoặc khi Admin hủy. Hệ thống cập nhật đơn sang `CANCELLED`, hoàn trả tồn kho và lượt dùng mã giảm giá. Do đơn chưa thanh toán thành công nên chưa cộng điểm và không cần thu hồi điểm. Khách thấy "Đơn hàng đã bị hủy". **Kết thúc luồng.**
 
 Nhánh hủy đơn không nối bằng mũi tên từ các bước trên vì việc hủy xảy ra theo thời gian hoặc do Admin, độc lập với thao tác của khách.
@@ -210,7 +217,7 @@ Mỗi nút quyết định trên sơ đồ có hai nhánh **Có** và **Không**
 |---|---|---|---|
 | Đã đăng nhập? | Khách có phiên đăng nhập hợp lệ | Tiếp tục kiểm tra giỏ hàng | Khách đăng nhập rồi tiếp tục |
 | Đủ tồn kho? | Mọi món trong giỏ còn đủ số lượng | Tạo đơn `PENDING` | Báo hết hàng, khách cập nhật giỏ, **quay lại bước kiểm tra giỏ hàng & tồn kho** |
-| Giao dịch thành công? | Cổng thanh toán xác nhận thành công | Đơn `PAID`, kết thúc thành công | Đơn `PAYMENT_FAILED`, báo lỗi cho khách |
+| Giao dịch thành công? | Payment Service xác nhận thành công | Đơn `PAID`, kết thúc thành công | Đơn `PAYMENT_FAILED`, báo lỗi cho khách |
 | Khách bấm "Thử lại"? | Khách chọn thanh toán lại | Quay lại vòng lặp thanh toán | Đơn giữ `PAYMENT_FAILED`; khách có thể thanh toán lại từ "Đơn của tôi" |
 
 ---
@@ -246,7 +253,7 @@ Các ngoại lệ chi tiết hơn (mã giảm giá không dùng được, thanh 
   (PENDING cũng chuyển sang CANCELLED khi quá hạn thanh toán hoặc Admin hủy)
 ```
 
-*(Ghi chú: Sơ đồ mô tả phạm vi từ lúc đặt đơn đến khi thanh toán thành công hoặc đơn bị hủy khi chưa thanh toán. Quy trình pha chế và giao nhận đồ uống sau trạng thái `PAID` không thuộc phạm vi của sơ đồ hoạt động này.)*
+*(Ghi chú: Sơ đồ mô tả phạm vi từ lúc đặt đơn đến khi thanh toán thành công hoặc đơn bị hủy khi chưa thanh toán. Sau `PAID`, sơ đồ chỉ thể hiện Admin cập nhật trạng thái đơn ở mức tóm tắt (Đang pha chế → Sẵn sàng) và khách nhận đơn; chi tiết xử lý đơn thuộc FR-08.)*
 
 ---
 
@@ -263,5 +270,6 @@ Cột **Mã Yêu cầu** ghi mã yêu cầu chức năng (FR-xx) và yêu cầu 
 | Chọn phương thức, gửi yêu cầu kèm `Idempotency-Key` | FR-06; NFR-05 | AC-06.7, AC-06.11, AC-N05.3 | Mỗi lần thanh toán có một khóa riêng; gửi lặp cùng khóa chỉ bị tính tiền một lần |
 | Thanh toán thành công | FR-06; NFR-02 | AC-06.1, AC-06.2, AC-06.3, AC-06.4, AC-N02.5 | Đơn chuyển `PAID`; điểm tích lũy được cộng; giỏ hàng được làm trống; quản trị viên được thông báo; khách thấy màn hình đặt hàng thành công |
 | Thanh toán thất bại và thử lại | FR-06, FR-07; NFR-03, NFR-05 | AC-06.5, AC-06.6, AC-06.13, AC-07.7, AC-N03.4 | Đơn chuyển `PAYMENT_FAILED`; quản trị viên được thông báo; khách thấy lỗi, có thể thử lại bằng khóa mới hoặc thanh toán lại từ "Đơn của tôi" |
+| Admin nhận thông báo, cập nhật trạng thái đơn; khách nhận đơn | FR-07, FR-08; NFR-02 | AC-06.4, AC-08.12 | Admin thấy đơn chờ pha chế và chuyển Đang pha chế → Sẵn sàng; khách nhận đơn và hoàn tất |
 | Chuyển sang theo dõi đơn | FR-07; NFR-02 | AC-07.1, AC-07.2, AC-07.4, AC-N02.2 | Khách xem được trạng thái đơn vừa đặt |
 | Hủy đơn (quá hạn thanh toán hoặc Admin hủy), hoàn trả | FR-07, FR-08; NFR-05 | AC-08.7, AC-07.8 | Đơn chuyển `CANCELLED`; tồn kho và lượt dùng mã được hoàn trả; không thu hồi điểm vì chưa cộng; khách thấy trạng thái "Đã hủy" |
