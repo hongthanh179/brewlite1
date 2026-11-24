@@ -47,7 +47,6 @@ export default function NotificationBell() {
     const [filter, setFilter] = useState<"all" | "unread">("all");
     const [loading, setLoading] = useState(false);
 
-    // State hỗ trợ vuốt xuống để đóng Bottom Sheet trên mobile
     const [dragOffset, setDragOffset] = useState(0);
     const touchStartY = useRef<number | null>(null);
 
@@ -95,7 +94,6 @@ export default function NotificationBell() {
         };
     }, [loadData]);
 
-    // Đóng popup khi click ra ngoài (tương thích cả Portal trên Desktop) hoặc nhấn ESC
     useEffect(() => {
         if (!open) return;
 
@@ -123,7 +121,6 @@ export default function NotificationBell() {
         };
     }, [open]);
 
-    // Khóa cuộn nền khi mở Bottom Sheet trên Mobile PWA
     useEffect(() => {
         if (open) {
             document.body.classList.add("overflow-hidden", "sm:overflow-auto");
@@ -136,14 +133,13 @@ export default function NotificationBell() {
 
     const markAsRead = async (id: number) => {
         if (!user?.id) return;
-        // Optimistic update: phản hồi tức thì trên giao diện mobile
         setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, isRead: true } : n)));
         setUnreadCount((c) => Math.max(0, c - 1));
 
         try {
             await apiFetch(`/notifications/me/${id}/read?userId=${user.id}`, { method: "PATCH" });
         } catch (err: any) {
-            loadData(); // Đồng bộ lại nếu lỗi mạng
+            loadData();
             toast.error(err.message || "Không thể cập nhật trạng thái");
         }
     };
@@ -154,7 +150,6 @@ export default function NotificationBell() {
         const prevList = notifications;
         const prevCount = unreadCount;
 
-        // Optimistic update
         setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
         setUnreadCount(0);
 
@@ -188,22 +183,23 @@ export default function NotificationBell() {
         const targetAnchor = `order-${orderId}`;
 
         if (pathname === "/shop/orders") {
-            const el = document.getElementById(targetAnchor);
-            if (el) {
-                el.scrollIntoView({ behavior: "smooth", block: "center" });
-                el.classList.add("ring-2", "ring-[#B45F2B]", "shadow-lg");
-                setTimeout(() => {
-                    el.classList.remove("ring-2", "ring-[#B45F2B]", "shadow-lg");
-                }, 3000);
-            } else {
-                window.location.hash = targetAnchor;
-            }
+            setTimeout(() => {
+                const el = document.getElementById(targetAnchor);
+                if (el) {
+                    el.scrollIntoView({ behavior: "smooth", block: "center" });
+                    el.classList.add("ring-2", "ring-[#B45F2B]", "shadow-lg");
+                    setTimeout(() => {
+                        el.classList.remove("ring-2", "ring-[#B45F2B]", "shadow-lg");
+                    }, 3000);
+                } else {
+                    window.location.hash = targetAnchor;
+                }
+            }, 50);
         } else {
             router.push(`/shop/orders#${targetAnchor}`);
         }
     };
 
-    // Xử lý vuốt xuống trên thanh kéo (Drag Handle / Header)
     const handleTouchStart = (e: React.TouchEvent) => {
         touchStartY.current = e.touches[0].clientY;
     };
@@ -230,7 +226,7 @@ export default function NotificationBell() {
         filter === "unread" ? notifications.filter((n) => !n.isRead) : notifications;
 
     const sheetContent = (
-        <div className="fixed inset-0 z-50 flex flex-col justify-end sm:block sm:pointer-events-none">
+        <div className="fixed inset-0 z-[60] flex flex-col justify-end sm:block sm:pointer-events-none">
             {/* Backdrop mờ nền trên Mobile */}
             <div
                 className="fixed inset-0 bg-black/50 backdrop-blur-xs sm:hidden animate-in fade-in duration-200"
@@ -245,33 +241,29 @@ export default function NotificationBell() {
                 }}
                 className="relative z-10 w-full max-h-[85dvh] rounded-t-3xl bg-[#FFFFFF] border-t sm:border border-[#E8E2D9] shadow-2xl flex flex-col overflow-hidden pointer-events-auto transition-transform duration-150 ease-out sm:fixed sm:top-16 sm:right-6 sm:w-96 sm:max-h-[32rem] sm:rounded-2xl animate-in slide-in-from-bottom sm:slide-in-from-top-2 duration-200"
             >
-                {/* Vùng kéo (Swipe Handle + Header) */}
+                {/* Vùng kéo (Swipe Handle + Header) - thêm touch-none chống pull-to-refresh */}
                 <div
                     onTouchStart={handleTouchStart}
                     onTouchMove={handleTouchMove}
                     onTouchEnd={handleTouchEnd}
-                    className="bg-[#FAF7F2] border-b border-[#E8E2D9] shrink-0 select-none"
+                    className="bg-[#FAF7F2] border-b border-[#E8E2D9] shrink-0 select-none touch-none"
                 >
-                    {/* Thanh quai kéo trên Mobile */}
                     <div className="pt-2.5 pb-1 flex justify-center sm:hidden">
                         <div className="w-10 h-1.5 bg-[#D5CBC0] rounded-full" />
                     </div>
 
-                    {/* Hàng tiêu đề & Nút đóng chuẩn chạm 44px */}
                     <div className="flex items-center justify-between px-4 py-2.5 sm:py-3.5">
                         <div className="flex items-center gap-2">
                             <div className="w-8 h-8 rounded-full bg-[#B45F2B]/12 flex items-center justify-center text-[#B45F2B]">
                                 <BellRing className="w-4 h-4" />
                             </div>
-                            <div>
-                                <div className="flex items-center gap-1.5">
-                                    <h3 className="font-bold text-sm text-[#2B2118]">Thông báo</h3>
-                                    {unreadCount > 0 && (
-                                        <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#B45F2B] text-white">
-                                            {unreadCount}
-                                        </span>
-                                    )}
-                                </div>
+                            <div className="flex items-center gap-1.5">
+                                <h3 className="font-bold text-sm text-[#2B2118]">Thông báo</h3>
+                                {unreadCount > 0 && (
+                                    <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#B45F2B] text-white">
+                                        {unreadCount}
+                                    </span>
+                                )}
                             </div>
                         </div>
 
@@ -398,7 +390,6 @@ export default function NotificationBell() {
 
     return (
         <div className="relative" ref={triggerRef}>
-            {/* Nút Chuông chuẩn touch target >= 44x44px (min-w-11 min-h-11) */}
             <Button
                 variant="ghost"
                 size="icon"
