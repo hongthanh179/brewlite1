@@ -1,0 +1,52 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+actor "Khách hàng" as Customer
+actor "Quản trị viên" as Admin
+actor "Payment Service" as PaymentService <<system>>
+
+rectangle "BrewLite" {
+  ' Cụm chức năng của Khách hàng
+  usecase "Xem menu & danh\nmục (UC-01)" as UC01
+  usecase "Xem chi tiết & Tùy chọn\n(Size, Topping) (UC-02)" as UC02
+  usecase "Quản lí\ngiỏ hàng (UC-03)" as UC03
+  usecase "Đăng kí / Đăng\nnhập (UC-04)" as UC04
+  usecase "Đặt đơn hàng\n(UC-05)" as UC05
+  usecase "Thanh toán đơn\nhàng (UC-07)" as UC07
+  usecase "Xem lịch sử &\ntheo dõi đơn (UC-09)" as UC09
+
+  ' Cụm xác thực chung & Quản trị viên
+  usecase "Đăng\nnhập (UC-10)" as Login
+  usecase "Quản lý thực đơn & Giảm\ngiá (UC-12)" as UC12
+  usecase "Tiếp nhận &\nCập nhật trạng thái đơn\n(UC-11)" as UC11
+  usecase "Xem\nthông báo hệ thống\n(UC-13)" as UC13
+}
+
+' Liên kết Actor - Use case (Khách hàng)
+Customer -- UC01
+Customer -- UC02
+Customer -- UC03
+Customer -- UC04
+Customer -- UC05
+Customer -- UC07
+Customer -- UC09
+
+' Liên kết Actor - Use case (Quản trị viên & Payment Service)
+Admin -- Login
+Admin -- UC12
+Admin -- UC11
+Admin -- UC13
+PaymentService -- UC07
+
+' Quan hệ <<include>>
+UC05 ..> UC04 : <<include>>
+UC09 ..> UC04 : <<include>>
+
+UC12 ..> Login : <<include>>
+UC11 ..> Login : <<include>>
+UC13 ..> Login : <<include>>
+
+@enduml
