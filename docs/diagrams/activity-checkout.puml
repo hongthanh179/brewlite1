@@ -1,4 +1,4 @@
-@startuml activity-checkout
+@startuml
 !pragma layout smetana
 
 skinparam conditionStyle diamond
@@ -21,9 +21,10 @@ skinparam DefaultTextAlignment center
 
 title Activity Diagram - Luồng Đặt hàng & Thanh toán (BrewLite Checkout Flow)
 
-|#EBF5FB|Customer|
-|#FEF9E7|System|
-|#EAFAF1|Payment Gateway|
+|Customer|
+|System|
+|Payment Service|
+|Admin|
 
 |Customer|
 start
@@ -35,12 +36,11 @@ start
 |System|
 :Kiểm tra trạng thái đăng nhập;
 
-' SỬA LẠI ĐIỀU KIỆN ĐĂNG NHẬP ĐỂ HIỂN THỊ RÕ CÓ/KHÔNG
 if (Đã đăng nhập?) then (Có)
   ' Đã đăng nhập thì đi tiếp
 else (Không)
   |Customer|
-  :Đăng nhập;
+  :Đăng nhập/Đăng kí;
   |System|
 endif
 
@@ -53,7 +53,6 @@ backward: Hiển thị "Món đã hết hoặc không đủ số lượng"
 <size:10><i>Đơn không được tạo, không trừ tồn kho
 Khách cập nhật lại Giỏ hàng;
   |System|
-' SỬA NHÃN VÒNG LẶP TỒN KHO THÀNH KHÔNG / CÓ
 repeat while (Đủ tồn kho?) is (Không) not (Có)
 
 :Tạo đơn hàng (PENDING)
@@ -74,7 +73,7 @@ repeat
   |System|
   :Chuyển yêu cầu sang cổng thanh toán;
 
-  |Payment Gateway|
+  |Payment Service|
   :Xử lý giao dịch;
 
   |System|
@@ -87,6 +86,13 @@ repeat
     |Customer|
     :Hiển thị màn hình Đặt hàng thành công;
     :Chuyển sang Theo dõi đơn hàng;
+
+    |Admin|
+    :Nhận thông báo & cập nhật trạng thái đơn
+    <size:10><i>Đang pha chế -> Sẵn sàng;
+
+    |Customer|
+    :Nhận đơn hàng & hoàn tất;
     stop
   else (Không)
     |System|
@@ -96,16 +102,14 @@ repeat
     |Customer|
     :Hiển thị "Thanh toán thất bại";
   endif
-' NHÃN VÒNG LẶP THỬ LẠI ĐÃ CHUẨN CÓ / KHÔNG
 repeat while (Khách hàng bấm "Thử lại"?) is (Có) not (Không)
 
-' ===== KHÔNG THỬ LẠI =====
+' ===== KHÔNG THỬ LẠI -> HỦY ĐƠN (liền mạch) =====
 |Customer|
-:Đơn hàng giữ trạng thái PAYMENT_FAILED;
-:Khách có thể thanh toán lại từ "Đơn của tôi";
-stop
+:Đơn hàng giữ trạng thái PAYMENT_FAILED
+<size:10><i>Khách vẫn có thể thanh toán lại từ "Đơn của tôi"
+<size:10><i>cho đến khi hết thời hạn;
 
-' ===== NHÁNH HỦY ĐƠN (Xử lý ngầm định) =====
 |System|
 :Quá thời hạn thanh toán (hoặc Admin hủy);
 :Cập nhật đơn hàng -> CANCELLED;
