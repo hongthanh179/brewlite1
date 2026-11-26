@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Logger,
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -378,6 +379,28 @@ export class OrdersService {
         data: newOrder,
       };
     });
+  }
+
+  // =========================================================================
+  // KHÁCH HÀNG TỰ HỦY ĐƠN HÀNG CHƯA THANH TOÁN (PENDING / PAYMENT_FAILED)
+  // =========================================================================
+  async cancelByCustomer(id: number, userId: number) {
+    const order = await this.findOne(id);
+
+    if (order.userId !== userId) {
+      throw new ForbiddenException('Bạn không có quyền hủy đơn hàng này!');
+    }
+
+    if (
+        order.status !== OrderStatus.PENDING &&
+        order.status !== OrderStatus.PAYMENT_FAILED
+    ) {
+      throw new BadRequestException(
+          'Chỉ có thể hủy đơn hàng đang chờ thanh toán!',
+      );
+    }
+
+    return this.update(id, { status: OrderStatus.CANCELLED });
   }
 
   // =========================================================================
