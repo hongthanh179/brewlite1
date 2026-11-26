@@ -109,7 +109,7 @@ export default function ProfilePage() {
 
                 <div className="pt-3 border-t border-amber-900/60 flex justify-between items-center text-xs text-stone-400">
                     <span>Hạng: {points >= 100 ? "Thành viên Vàng" : "Thành viên Bạc"}</span>
-                    <span>1 Bean = 1.000đ khi đổi voucher</span>
+                    <span>10.000đ chi tiêu = 1 Bean tích lũy</span>
                 </div>
             </div>
 
