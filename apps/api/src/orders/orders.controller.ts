@@ -67,6 +67,23 @@ export class OrdersController {
     return this.ordersService.findByUserId(currentUserId);
   }
 
+  @Patch(':id/cancel')
+  @UseGuards(AuthGuard('jwt'))
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+        'Khách hàng tự hủy đơn hàng đang chờ thanh toán (PENDING / PAYMENT_FAILED)',
+  })
+  cancelOrder(@Req() req: any, @Param('id', ParseIntPipe) id: number) {
+    const currentUserId = req.user?.id || req.user?.userId || req.user?.sub;
+
+    if (!currentUserId) {
+      throw new BadRequestException('Vui lòng đăng nhập để hủy đơn hàng!');
+    }
+
+    return this.ordersService.cancelByCustomer(id, Number(currentUserId));
+  }
+
   // =========================================================================
   // 2. DÙNG CHUNG (ADMIN XEM HẾT, KHÁCH HÀNG CHỈ XEM ĐƠN CỦA MÌNH)
   // =========================================================================
